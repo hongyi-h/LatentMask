@@ -1,0 +1,62 @@
+# LatentMask Base Configuration
+# Shared hyperparameters for all experiments
+
+# ─── Training schedule ─────────────────────────────────────────────────
+training:
+  stage1_end: 50        # Warm-up epochs
+  stage2_end: 300       # Joint PU training ends
+  stage3_end: 400       # Total epochs (refinement ends)
+  iterations_per_epoch: 250
+  val_iterations_per_epoch: 50
+  save_every: 50
+
+# ─── Learning rate ─────────────────────────────────────────────────────
+optimizer:
+  type: SGD
+  initial_lr: 0.01
+  weight_decay: 3.0e-5
+  momentum: 0.99
+  nesterov: true
+  scheduler: poly
+
+# ─── Loss weights ──────────────────────────────────────────────────────
+loss:
+  lambda_pix: 1.0
+  lambda_box: 1.0
+  lambda_img: 0.5
+  lambda_prop: 0.5
+  lambda_smooth: 0.1
+  lambda_ref: 0.4
+  pi_base: 0.15
+
+# ─── PropNet architecture ─────────────────────────────────────────────
+propnet:
+  hidden_channels: [64, 32]
+  epsilon: 0.01
+  mode: learned          # learned | uniform
+  use_vesselness_hint: false   # optional PE-specific
+
+# ─── EMA teacher ──────────────────────────────────────────────────────
+ema:
+  decay: 0.999
+
+# ─── Refinement ───────────────────────────────────────────────────────
+refinement:
+  propensity_threshold: 0.5
+  confidence_threshold: 0.7
+  use_ema_refinement: true
+
+# ─── Synthetic missingness ────────────────────────────────────────────
+synthetic_missingness:
+  pattern: all           # all | scale_only | boundary_only | component_only | uniform
+  alpha: 5.0
+  r_max: 5
+  component_drop_scale: 1.0
+
+# ─── Data ──────────────────────────────────────────────────────────────
+data:
+  granularity_schedule: [pixel, pixel, box, image]
+  batch_size_pixel: 2
+  batch_size_box: 1
+  batch_size_image: 2
+  num_workers: 4

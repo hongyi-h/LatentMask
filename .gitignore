@@ -3,3 +3,10 @@ __pycache__/
 
 /data/
 _backup/
+
+/results/
+/refine-logs/
+
+FINAL_PROPOSAL_zh.md
+FINAL_PROPOSAL.md
+NOVELTY_CHECK_REPORT_v2.md

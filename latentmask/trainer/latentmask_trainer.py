@@ -1,958 +1,471 @@
+"""LatentMask Trainer: subclass of nnUNetTrainer for box-supervised segmentation.
+
+Overrides:
+  - on_train_start: pre-fit isotonic calibrator g_θ, compute π̂
+  - run_training: implements [pixel, pixel, box] batch cycle
+  - on_train_epoch_start: λ_box ramp schedule
+  - on_epoch_end: diagnostic logging (weights, Δ_area)
+  - get_dataloaders: creates separate pixel and box dataloaders
+
+Configuration via ipw_mode:
+  - 'none': no box loss (pixel-only baseline, R025-R027)
+  - 'uniform': w=1 for all boxes (SCAR baseline ≈ 3D-BoxSup, R028-R030)
+  - 'channel': isotonic g_θ IPW (our method, R032-R036)
+  - 'oracle': true g_true + true sizes (upper bound, R031+)
 """
-LatentMask Trainer — subclasses nnUNetTrainer.
-
-Integrates:
-  - Propensity Network (PropNet): domain-agnostic, encoder features only
-  - Multi-granularity data loading (pixel / box / image)
-  - Propensity-corrected PU losses
-  - EMA teacher for Stage 3 refinement
-  - Three-stage training schedule
-
-Usage via nnUNet CLI:
-    nnUNetv2_train DATASET CONFIG FOLD -tr LatentMaskTrainer
-"""
-
-from __future__ import annotations
-
+import json
 import os
-import itertools
+import sys
 from copy import deepcopy
+from time import time
+from typing import List
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from torch import autocast
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
-from nnunetv2.utilities.helpers import dummy_context
+from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
+from nnunetv2.utilities.helpers import empty_cache, dummy_context
 
-from latentmask.modules.propnet import PropensityNetwork, ConstantPropensity
-from latentmask.losses.combined import LatentMaskLoss
-from latentmask.trainer.ema import EMATeacher
-from latentmask.utils.synthetic_missingness import SyntheticMissingnessGenerator
+from latentmask.losses.bag_pu_loss import compute_batch_box_loss
+from latentmask.calibration.isotonic_fit import fit_isotonic, predict_propensity
+from latentmask.calibration.channel_simulator import make_channel_func, generate_box_annotations
+from latentmask.utils.cc_extraction import extract_connected_components
 
 
 class LatentMaskTrainer(nnUNetTrainer):
-    """
-    nnUNetTrainer with LatentMask PU learning extensions.
 
-    Three-stage schedule:
-      Stage 1 (epochs 0-49): Warm-up on pixel-only data + PropNet pre-training
-      Stage 2 (epochs 50-299): Joint PU training with all granularities
-      Stage 3 (epochs 300-399): Propensity-weighted EMA teacher refinement
+    # ── Configuration defaults ──────────────────────────────────────────
+    IPW_MODE = 'channel'       # 'none' | 'uniform' | 'channel' | 'oracle'
+    STEEPNESS = 'medium'       # 'shallow' | 'medium' | 'steep'
+    PIXEL_FRACTION = 0.3       # fraction of training data with pixel labels
+    WARMUP_EPOCHS = 50         # epochs of pixel-only training
+    RAMP_EPOCHS = 50           # epochs of λ_box linear ramp
+    LAMBDA_BOX_MAX = 1.0       # maximum box loss weight
+    W_MAX = 10.0               # IPW weight clipping
+    D_MARGIN = 5               # safe zone margin in voxels
+    PI_HAT_SCALE = 1.0         # multiplier for π̂ (for sensitivity ablation)
+    MIN_CC_SIZE = 10           # minimum CC size to consider
+    DIAG_EPOCHS = [50, 100, 150, 200, 250, 300]  # when to log diagnostics
 
-    Configurable via --c flag:
-      propnet_mode=learned|uniform  (default: learned)
-      use_smoothness=true|false     (default: true)
-      use_ema_refinement=true|false (default: true)
-      synthetic_pattern=all|scale_only|boundary_only|component_only|scale_boundary|uniform
-      use_vesselness_hint=true|false (default: false, PE-specific optional)
-    """
-
-    # ─── Stage boundaries ──────────────────────────────────────────────
-    STAGE1_END = 50
-    STAGE2_END = 300
-    STAGE3_END = 400
-
-    # ─── Loss lambdas ─────────────────────────────────────────────────
-    LAMBDA_PIX = 1.0
-    LAMBDA_BOX = 1.0
-    LAMBDA_IMG = 0.5
-    LAMBDA_PROP = 0.5
-    LAMBDA_SMOOTH = 0.1
-    LAMBDA_REF = 0.4
-
-    # ─── PU hyperparameters ────────────────────────────────────────────
-    PI_BASE = 0.15
-    EMA_DECAY = 0.999
-
-    # ─── Granularity ratio per iteration cycle ─────────────────────────
-    GRAN_SCHEDULE = ["pixel", "pixel", "box", "image"]
-
-    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device("cuda")):
+    def __init__(self, plans, configuration, fold, dataset_json,
+                 device=torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
 
-        self.num_epochs = self.STAGE3_END
-        self.save_every = 50
+        # Override training length
+        self.num_epochs = 300
 
-        # Will be set in initialize()
-        self.propnet = None
-        self.ema_teacher = None
-        self.latentmask_loss = None
-        self.missingness_gen = None
+        # Read config from environment (for CLI compatibility)
+        self.ipw_mode = os.environ.get('LM_IPW_MODE', self.IPW_MODE)
+        self.steepness = os.environ.get('LM_STEEPNESS', self.STEEPNESS)
+        self.pixel_fraction = float(os.environ.get('LM_PIXEL_FRACTION',
+                                                    self.PIXEL_FRACTION))
+        self.warmup_epochs = int(os.environ.get('LM_WARMUP_EPOCHS',
+                                                 self.WARMUP_EPOCHS))
+        self.ramp_epochs = int(os.environ.get('LM_RAMP_EPOCHS',
+                                               self.RAMP_EPOCHS))
+        self.lambda_box_max = float(os.environ.get('LM_LAMBDA_BOX_MAX',
+                                                     self.LAMBDA_BOX_MAX))
+        self.w_max = float(os.environ.get('LM_W_MAX', self.W_MAX))
+        self.d_margin = int(os.environ.get('LM_D_MARGIN', self.D_MARGIN))
+        self.pi_hat_scale = float(os.environ.get('LM_PI_HAT_SCALE',
+                                                   self.PI_HAT_SCALE))
 
-        # Extra data loaders (box, image) — set in on_train_start
+        # Will be set during on_train_start
+        self.g_theta = None       # isotonic calibrator
+        self.g_theta_s0 = None    # minimum support
+        self.pi_hat = None        # class prior
+        self.g_true = None        # ground-truth channel (for simulation)
+        self.lambda_box = 0.0     # current box loss weight
+        self.pixel_keys = []
+        self.box_keys = []
+        self.box_annotations = {}  # key -> list of box dicts
         self.dataloader_box = None
-        self.dataloader_image = None
-        self.box_iter = None
-        self.image_iter = None
+        self.diag_log = []
 
-        # Paths to auxiliary manifests (set via env vars or config)
-        self.rspect_manifest = os.environ.get("LATENTMASK_RSPECT_MANIFEST", "")
-        self.aug_rspect_manifest = os.environ.get("LATENTMASK_AUG_RSPECT_MANIFEST", "")
+        if self.ipw_mode == 'none':
+            self.warmup_epochs = self.num_epochs  # never use box loss
 
-        # Parse --c overrides
-        self._propnet_mode = "learned"
-        self._use_smoothness = True
-        self._use_ema_refinement = True
-        self._synthetic_pattern = "all"
-        self._use_vesselness_hint = False
+    # ── Dataloaders ─────────────────────────────────────────────────────
 
-    def set_custom_config(self, config_str: str):
-        """Parse comma-separated key=value overrides from --c flag."""
-        for pair in config_str.split(","):
-            pair = pair.strip()
-            if "=" not in pair:
-                continue
-            key, val = pair.split("=", 1)
-            key, val = key.strip(), val.strip()
-            if key == "propnet_mode":
-                self._propnet_mode = val
-            elif key == "use_smoothness":
-                self._use_smoothness = val.lower() == "true"
-            elif key == "use_ema_refinement":
-                self._use_ema_refinement = val.lower() == "true"
-            elif key == "synthetic_pattern":
-                self._synthetic_pattern = val
-            elif key == "use_vesselness_hint":
-                self._use_vesselness_hint = val.lower() == "true"
-
-    @property
-    def current_stage(self) -> int:
-        if self.current_epoch < self.STAGE1_END:
-            return 1
-        elif self.current_epoch < self.STAGE2_END:
-            return 2
-        else:
-            return 3 if self._use_ema_refinement else 2
-
-    # ─── Override: initialize ──────────────────────────────────────────
-
-    def initialize(self):
-        """Build network + PropNet + loss + optimizer."""
-        if not self.was_initialized:
-            super().initialize()
-
-            # Determine PropNet input channels from encoder stage
-            propnet_in_channels = self._get_encoder_stage3_channels()
-            if self._use_vesselness_hint:
-                propnet_in_channels += 1  # optional vesselness concatenation
-
-            if self._propnet_mode == "uniform":
-                self.propnet = ConstantPropensity(value=0.5).to(self.device)
-            else:
-                self.propnet = PropensityNetwork(
-                    in_channels=propnet_in_channels,
-                    hidden_channels=(64, 32),
-                    epsilon=0.01,
-                    spatial_dims=3,
-                ).to(self.device)
-
-            self.latentmask_loss = LatentMaskLoss(
-                pi_base=self.PI_BASE,
-                lambda_pix=self.LAMBDA_PIX,
-                lambda_box=self.LAMBDA_BOX,
-                lambda_img=self.LAMBDA_IMG,
-                lambda_prop=self.LAMBDA_PROP,
-                lambda_smooth=self.LAMBDA_SMOOTH,
-                lambda_ref=self.LAMBDA_REF,
-            )
-
-            self.missingness_gen = SyntheticMissingnessGenerator(
-                pattern=self._synthetic_pattern,
-                spatial_dims=3,
-            )
-
-            if not self._use_ema_refinement:
-                self.num_epochs = self.STAGE2_END
-
-            # Re-create optimizer to include PropNet parameters
-            self.optimizer, self.lr_scheduler = self.configure_optimizers()
-
-            self.print_to_log_file(
-                f"LatentMask initialized: PropNet mode={self._propnet_mode}, "
-                f"params={sum(p.numel() for p in self.propnet.parameters())}, "
-                f"pattern={self._synthetic_pattern}, "
-                f"smoothness={self._use_smoothness}, "
-                f"ema_ref={self._use_ema_refinement}"
-            )
-
-    def _get_encoder_stage3_channels(self) -> int:
-        """Probe the network to find the number of channels at encoder stage 3."""
-        mod = self.network.module if hasattr(self.network, "module") else self.network
-        if hasattr(mod, "_orig_mod"):
-            mod = mod._orig_mod
-
-        try:
-            encoder = mod.encoder
-            n_stages = len(encoder.stages)
-            target_stage = min(3, n_stages - 1)
-            stage = encoder.stages[target_stage]
-            if hasattr(stage, "blocks"):
-                last_block = stage.blocks[-1]
-            else:
-                last_block = list(stage.children())[-1]
-
-            for m in reversed(list(last_block.modules())):
-                if isinstance(m, (nn.Conv3d, nn.Conv2d)):
-                    return m.out_channels
-
-            return 256
-        except Exception:
-            self.print_to_log_file(
-                "WARNING: Could not probe encoder stage 3 channels, defaulting to 256"
-            )
-            return 256
-
-    # ─── Override: configure_optimizers ─────────────────────────────────
-
-    def configure_optimizers(self):
-        """Include PropNet parameters in the optimizer."""
-        params = list(self.network.parameters())
-        if self.propnet is not None:
-            params += list(self.propnet.parameters())
-
-        optimizer = torch.optim.SGD(
-            params,
-            self.initial_lr,
-            weight_decay=self.weight_decay,
-            momentum=0.99,
-            nesterov=True,
+    def get_dataloaders(self):
+        """Create pixel dataloader (standard) + box dataloader (separate)."""
+        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+        from batchgenerators.dataloading.single_threaded_augmenter import (
+            SingleThreadedAugmenter,
         )
-        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
-        return optimizer, lr_scheduler
+        from batchgenerators.dataloading.nondet_multi_threaded_augmenter import (
+            NonDetMultiThreadedAugmenter,
+        )
 
-    # ─── Override: on_train_start ──────────────────────────────────────
+        if self.dataset_class is None:
+            self.dataset_class = infer_dataset_class(
+                self.preprocessed_dataset_folder
+            )
+
+        patch_size = self.configuration_manager.patch_size
+        deep_supervision_scales = self._get_deep_supervision_scales()
+        (
+            rotation_for_DA, do_dummy_2d_data_aug,
+            initial_patch_size, mirror_axes,
+        ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+
+        tr_transforms = self.get_training_transforms(
+            patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes,
+            do_dummy_2d_data_aug,
+            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+            is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
+            regions=(self.label_manager.foreground_regions
+                     if self.label_manager.has_regions else None),
+            ignore_label=self.label_manager.ignore_label,
+        )
+        val_transforms = self.get_validation_transforms(
+            deep_supervision_scales, is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
+            regions=(self.label_manager.foreground_regions
+                     if self.label_manager.has_regions else None),
+            ignore_label=self.label_manager.ignore_label,
+        )
+
+        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+
+        # ── Split training keys ──────────────────────────────────────
+        all_keys = sorted(dataset_tr.identifiers)
+        rng = np.random.default_rng(seed=12345 + self.fold)
+        perm = rng.permutation(len(all_keys)).tolist()
+        n_pixel = max(1, int(self.pixel_fraction * len(all_keys)))
+
+        if self.ipw_mode == 'none':
+            # Pixel-only baseline: use only the pixel subset
+            self.pixel_keys = [all_keys[i] for i in perm[:n_pixel]]
+            self.box_keys = []
+        else:
+            self.pixel_keys = [all_keys[i] for i in perm[:n_pixel]]
+            self.box_keys = [all_keys[i] for i in perm[n_pixel:]]
+            if len(self.box_keys) == 0:
+                self.print_to_log_file(
+                    'WARNING: no box keys (dataset too small for split). '
+                    'Falling back to pixel-only training.'
+                )
+                self.ipw_mode = 'none'
+                self.warmup_epochs = self.num_epochs
+
+        self.print_to_log_file(
+            f"LatentMask split: {len(self.pixel_keys)} pixel, "
+            f"{len(self.box_keys)} box, mode={self.ipw_mode}"
+        )
+
+        # ── Pixel DataLoader ─────────────────────────────────────────
+        # Create a dataset view with only pixel keys
+        pixel_dataset = self.dataset_class(
+            self.preprocessed_dataset_folder, self.pixel_keys,
+            folder_with_segs_from_previous_stage=
+            self.folder_with_segs_from_previous_stage,
+        )
+        dl_pixel = nnUNetDataLoader(
+            pixel_dataset, self.batch_size, initial_patch_size,
+            self.configuration_manager.patch_size, self.label_manager,
+            oversample_foreground_percent=self.oversample_foreground_percent,
+            sampling_probabilities=None, pad_sides=None,
+            transforms=tr_transforms,
+            probabilistic_oversampling=self.probabilistic_oversampling,
+        )
+
+        # ── Box DataLoader ────────────────────────────────────────────
+        if len(self.box_keys) > 0:
+            box_dataset = self.dataset_class(
+                self.preprocessed_dataset_folder, self.box_keys,
+                folder_with_segs_from_previous_stage=
+                self.folder_with_segs_from_previous_stage,
+            )
+            dl_box_raw = nnUNetDataLoader(
+                box_dataset, self.batch_size, initial_patch_size,
+                self.configuration_manager.patch_size, self.label_manager,
+                oversample_foreground_percent=self.oversample_foreground_percent,
+                sampling_probabilities=None, pad_sides=None,
+                transforms=tr_transforms,
+                probabilistic_oversampling=self.probabilistic_oversampling,
+            )
+            self.dataloader_box = SingleThreadedAugmenter(dl_box_raw, None)
+            _ = next(self.dataloader_box)  # prime
+        else:
+            self.dataloader_box = None
+
+        # ── Validation DataLoader ─────────────────────────────────────
+        dl_val = nnUNetDataLoader(
+            dataset_val, self.batch_size,
+            self.configuration_manager.patch_size,
+            self.configuration_manager.patch_size, self.label_manager,
+            oversample_foreground_percent=self.oversample_foreground_percent,
+            sampling_probabilities=None, pad_sides=None,
+            transforms=val_transforms,
+            probabilistic_oversampling=self.probabilistic_oversampling,
+        )
+
+        # Wrap in augmentation threads
+        from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
+        allowed = get_allowed_n_proc_DA()
+        if allowed == 0:
+            mt_pixel = SingleThreadedAugmenter(dl_pixel, None)
+            mt_val = SingleThreadedAugmenter(dl_val, None)
+        else:
+            mt_pixel = NonDetMultiThreadedAugmenter(
+                data_loader=dl_pixel, transform=None,
+                num_processes=allowed,
+                num_cached=max(6, allowed // 2), seeds=None,
+                pin_memory=self.device.type == 'cuda', wait_time=0.002,
+            )
+            mt_val = NonDetMultiThreadedAugmenter(
+                data_loader=dl_val, transform=None,
+                num_processes=max(1, allowed // 2),
+                num_cached=max(3, allowed // 4), seeds=None,
+                pin_memory=self.device.type == 'cuda', wait_time=0.002,
+            )
+
+        _ = next(mt_pixel)
+        _ = next(mt_val)
+        return mt_pixel, mt_val
+
+    # ── Pre-training calibration ────────────────────────────────────────
 
     def on_train_start(self):
         super().on_train_start()
+        self._prefit_calibration()
 
-        # Initialize EMA teacher
-        self.ema_teacher = EMATeacher(self.network, decay=self.EMA_DECAY)
-        self.ema_teacher.to(self.device)
+    def _prefit_calibration(self):
+        """Pre-fit isotonic g_θ and estimate π̂ on pixel subset."""
+        self.print_to_log_file("Pre-fitting calibration...")
 
-        # Set up auxiliary data loaders for box and image data
-        self._setup_auxiliary_dataloaders()
+        if self.ipw_mode == 'none':
+            self.print_to_log_file("  ipw_mode=none, skipping calibration.")
+            return
 
-        self.print_to_log_file(
-            f"LatentMask training: {self.num_epochs} epochs, "
-            f"stages at {self.STAGE1_END}/{self.STAGE2_END}/{self.STAGE3_END}"
-        )
+        # Collect CCs from pixel-labeled cases
+        all_log_sizes = []
+        all_fg_counts = []
+        all_total_counts = []
 
-    def _setup_auxiliary_dataloaders(self):
-        """Set up DataLoaders for box-level and image-level data."""
-        from latentmask.data.datasets import BoxDataset, ImageDataset
-        from torch.utils.data import DataLoader
+        for key in self.pixel_keys:
+            data, seg, _, props = self.dataset_class(
+                self.preprocessed_dataset_folder, [key],
+            ).load_case(key)
+            seg_np = seg[0]  # shape (D, H, W)
+            ccs = extract_connected_components(seg_np, min_size=self.MIN_CC_SIZE)
+            for cc in ccs:
+                all_log_sizes.append(cc['log_size'])
+            all_fg_counts.append(int((seg_np > 0).sum()))
+            all_total_counts.append(int(seg_np.size))
 
-        patch_size = tuple(self.configuration_manager.patch_size)
+        # Estimate π̂
+        total_fg = sum(all_fg_counts)
+        total_vox = sum(all_total_counts)
+        self.pi_hat = (total_fg / max(total_vox, 1)) * self.pi_hat_scale
+        self.print_to_log_file(f"  π̂ = {self.pi_hat:.6f} "
+                                f"(scale={self.pi_hat_scale})")
 
-        # Box-level loader (Augmented RSPECT)
-        if self.aug_rspect_manifest and os.path.isfile(self.aug_rspect_manifest):
-            box_ds = BoxDataset(
-                manifest_csv=self.aug_rspect_manifest,
-                patch_size=patch_size,
-            )
-            self.dataloader_box = DataLoader(
-                box_ds,
-                batch_size=1,
-                shuffle=True,
-                num_workers=2,
-                pin_memory=True,
-                drop_last=True,
-            )
-            self.print_to_log_file(
-                f"Box dataloader: {len(box_ds)} studies from {self.aug_rspect_manifest}"
-            )
-        else:
-            self.dataloader_box = None
-            self.print_to_log_file("WARNING: No box-level manifest set. Skipping box data.")
+        if len(all_log_sizes) == 0:
+            self.print_to_log_file("  WARNING: no CCs found, skipping fit.")
+            return
 
-        # Image-level loader (RSPECT)
-        if self.rspect_manifest and os.path.isfile(self.rspect_manifest):
-            img_ds = ImageDataset(
-                manifest_csv=self.rspect_manifest,
-                patch_size=patch_size,
-            )
-            self.dataloader_image = DataLoader(
-                img_ds,
-                batch_size=2,
-                shuffle=True,
-                num_workers=2,
-                pin_memory=True,
-                drop_last=True,
-            )
-            self.print_to_log_file(
-                f"Image dataloader: {len(img_ds)} studies from {self.rspect_manifest}"
-            )
-        else:
-            self.dataloader_image = None
-            self.print_to_log_file("WARNING: No image-level manifest set. Skipping image data.")
+        # Compute μ (median log-CC-size) for channel function
+        all_log_sizes = np.array(all_log_sizes)
+        mu = float(np.median(all_log_sizes))
+        self.print_to_log_file(f"  μ (median log-CC-size) = {mu:.2f}, "
+                                f"n_CCs = {len(all_log_sizes)}")
 
-        # Create infinite iterators
-        self.box_iter = (
-            itertools.cycle(self.dataloader_box) if self.dataloader_box else None
-        )
-        self.image_iter = (
-            itertools.cycle(self.dataloader_image)
-            if self.dataloader_image
-            else None
-        )
+        # Create channel function
+        self.g_true = make_channel_func(self.steepness, mu)
 
-    # ─── Override: on_train_epoch_start ────────────────────────────────
+        # Simulate channel on pixel CCs → fit isotonic
+        rng = np.random.default_rng(seed=42 + self.fold)
+        true_probs = self.g_true(all_log_sizes)
+        selection = (rng.random(len(all_log_sizes)) < true_probs).astype(float)
+
+        self.g_theta, self.g_theta_s0 = fit_isotonic(all_log_sizes, selection)
+        self.print_to_log_file(f"  g_θ fitted: s0={self.g_theta_s0:.2f}")
+
+        # Save calibration results
+        calib_path = os.path.join(self.output_folder, 'calibration_prefit.json')
+        calib_results = {
+            'pi_hat': self.pi_hat,
+            'mu': mu,
+            's0': self.g_theta_s0,
+            'n_ccs': len(all_log_sizes),
+            'steepness': self.steepness,
+            'ipw_mode': self.ipw_mode,
+        }
+        with open(calib_path, 'w') as f:
+            json.dump(calib_results, f, indent=2)
+
+    # ── λ_box schedule ──────────────────────────────────────────────────
+
+    def _get_lambda_box(self):
+        """Compute current λ_box based on epoch."""
+        if self.current_epoch < self.warmup_epochs:
+            return 0.0
+        ramp_end = self.warmup_epochs + self.ramp_epochs
+        if self.current_epoch < ramp_end:
+            progress = ((self.current_epoch - self.warmup_epochs)
+                        / max(self.ramp_epochs, 1))
+            return self.lambda_box_max * progress
+        return self.lambda_box_max
 
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
-        stage = self.current_stage
-        self.print_to_log_file(f"  LatentMask Stage {stage}")
+        self.lambda_box = self._get_lambda_box()
+        self.print_to_log_file(f"  λ_box = {self.lambda_box:.4f}")
 
-        if self.propnet is not None:
-            self.propnet.train()
+    # ── Training loop ───────────────────────────────────────────────────
 
-    # ─── Override: train_step ──────────────────────────────────────────
+    def run_training(self):
+        """Main training loop with [pixel, pixel, box] batch cycle."""
+        self.on_train_start()
 
-    def train_step(self, batch: dict) -> dict:
-        """
-        LatentMask training step.
+        for epoch in range(self.current_epoch, self.num_epochs):
+            self.on_epoch_start()
+            self.on_train_epoch_start()
 
-        In Stage 1: only pixel batches.
-        In Stage 2+: cycles through pixel/box/image batches.
-        """
-        stage = self.current_stage
+            train_outputs = []
+            step_counter = 0
+            use_box = (self.lambda_box > 0 and self.dataloader_box is not None)
 
-        if stage == 1:
-            return self._train_step_pixel(batch, stage)
-        else:
-            if not hasattr(self, "_gran_counter"):
-                self._gran_counter = 0
+            for batch_id in range(self.num_iterations_per_epoch):
+                # Cycle: [pixel, pixel, box]
+                is_box_step = (use_box and step_counter % 3 == 2)
 
-            gran = self.GRAN_SCHEDULE[self._gran_counter % len(self.GRAN_SCHEDULE)]
-            self._gran_counter += 1
+                if is_box_step:
+                    batch = next(self.dataloader_box)
+                    out = self._box_train_step(batch)
+                else:
+                    batch = next(self.dataloader_train)
+                    out = self.train_step(batch)
 
-            if gran == "pixel":
-                return self._train_step_pixel(batch, stage)
-            elif gran == "box" and self.box_iter is not None:
-                box_batch = next(self.box_iter)
-                return self._train_step_box(box_batch, stage)
-            elif gran == "image" and self.image_iter is not None:
-                img_batch = next(self.image_iter)
-                return self._train_step_image(img_batch, stage)
-            else:
-                return self._train_step_pixel(batch, stage)
+                train_outputs.append(out)
+                step_counter += 1
 
-    def _get_propensity(self, encoder_feats: torch.Tensor, data: torch.Tensor | None = None) -> torch.Tensor:
-        """Compute propensity from encoder features (+ optional vesselness hint)."""
-        if self._use_vesselness_hint and data is not None:
-            from latentmask.utils.vesselness import compute_vesselness_tensor
-            vesselness = compute_vesselness_tensor(data)
-            if vesselness.shape[2:] != encoder_feats.shape[2:]:
-                vesselness = F.interpolate(
-                    vesselness, size=encoder_feats.shape[2:],
-                    mode="trilinear", align_corners=False,
-                )
-            feats = torch.cat([encoder_feats, vesselness], dim=1)
-            return self.propnet(feats)
-        return self.propnet(encoder_feats)
-
-    def _train_step_pixel(self, batch: dict, stage: int) -> dict:
-        """Train step for pixel-labeled data."""
-        data = batch["data"].to(self.device, non_blocking=True)
-        target = batch["target"]
-        if isinstance(target, list):
-            target = [t.to(self.device, non_blocking=True) for t in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-
-            if self.enable_deep_supervision and isinstance(output, (list, tuple)):
-                pred_hr = output[0]
-            else:
-                pred_hr = output
-
-            # Standard nnUNet loss for deep supervision
-            l_nnunet = self.loss(output, target)
-
-            # Get encoder features for PropNet
-            encoder_feats = self._get_encoder_features(data)
-            propensity = self._get_propensity(encoder_feats, data)
-
-            pred_prob = torch.sigmoid(pred_hr)
-
-            if isinstance(target, list):
-                target_hr = target[0]
-            else:
-                target_hr = target
-
-            if pred_prob.shape != target_hr.shape:
-                target_hr = F.interpolate(
-                    target_hr.float(), size=pred_prob.shape[2:], mode="nearest"
-                )
-
-            # Resize propensity to match pred spatial dims
-            if propensity.shape[2:] != pred_prob.shape[2:]:
-                propensity = F.interpolate(
-                    propensity, size=pred_prob.shape[2:],
-                    mode="trilinear", align_corners=False,
-                )
-
-            # Generate synthetic missingness for PropNet training
-            synth_propensity = None
-            positive_mask = None
-            if target_hr.sum() > 0:
-                _, synth_propensity = self.missingness_gen.generate_batch(target_hr)
-                positive_mask = (target_hr > 0).float()
-
-            # Compute LatentMask losses
-            lm_losses = self.latentmask_loss(
-                pred=pred_prob,
-                propensity=propensity,
-                batch_type="pixel",
-                stage=stage,
-                pixel_target=target_hr,
-                synthetic_propensity=synth_propensity,
-                positive_mask=positive_mask,
-                teacher_pred=self._get_teacher_pred(data) if stage >= 3 else None,
-                use_smoothness=self._use_smoothness,
-            )
-
-            total_loss = l_nnunet + lm_losses["total"]
-
-        self._backward_and_step(total_loss)
-
-        if stage >= 2:
-            self.ema_teacher.update(self.network)
-
-        return {"loss": total_loss.detach().cpu().numpy()}
-
-    def _train_step_box(self, batch: dict, stage: int) -> dict:
-        """Train step for box-labeled data."""
-        data = batch["data"].to(self.device, non_blocking=True)
-        box_mask = batch["box_mask"].to(self.device, non_blocking=True)
-        box_target = batch["target"].to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-
-            if self.enable_deep_supervision and isinstance(output, (list, tuple)):
-                pred_hr = output[0]
-            else:
-                pred_hr = output
-
-            pred_prob = torch.sigmoid(pred_hr)
-
-            encoder_feats = self._get_encoder_features(data)
-            propensity = self._get_propensity(encoder_feats, data)
-
-            if propensity.shape[2:] != pred_prob.shape[2:]:
-                propensity = F.interpolate(
-                    propensity, size=pred_prob.shape[2:],
-                    mode="trilinear", align_corners=False,
-                )
-
-            lm_losses = self.latentmask_loss(
-                pred=pred_prob,
-                propensity=propensity,
-                batch_type="box",
-                stage=stage,
-                box_mask=box_mask,
-                box_target=box_target,
-                teacher_pred=self._get_teacher_pred(data) if stage >= 3 else None,
-                use_smoothness=self._use_smoothness,
-            )
-
-            total_loss = lm_losses["total"]
-
-        self._backward_and_step(total_loss)
-        self.ema_teacher.update(self.network)
-
-        return {"loss": total_loss.detach().cpu().numpy()}
-
-    def _train_step_image(self, batch: dict, stage: int) -> dict:
-        """Train step for image-labeled data."""
-        data = batch["data"].to(self.device, non_blocking=True)
-        image_label = batch["image_label"].to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-
-            if self.enable_deep_supervision and isinstance(output, (list, tuple)):
-                pred_hr = output[0]
-            else:
-                pred_hr = output
-
-            pred_prob = torch.sigmoid(pred_hr)
-
-            encoder_feats = self._get_encoder_features(data)
-            propensity = self._get_propensity(encoder_feats, data)
-
-            if propensity.shape[2:] != pred_prob.shape[2:]:
-                propensity = F.interpolate(
-                    propensity, size=pred_prob.shape[2:],
-                    mode="trilinear", align_corners=False,
-                )
-
-            lm_losses = self.latentmask_loss(
-                pred=pred_prob,
-                propensity=propensity,
-                batch_type="image",
-                stage=stage,
-                image_label=image_label,
-                teacher_pred=self._get_teacher_pred(data) if stage >= 3 else None,
-                use_smoothness=self._use_smoothness,
-            )
-
-            total_loss = lm_losses["total"]
-
-        self._backward_and_step(total_loss)
-        self.ema_teacher.update(self.network)
-
-        return {"loss": total_loss.detach().cpu().numpy()}
-
-    # ─── Helpers ───────────────────────────────────────────────────────
-
-    def _backward_and_step(self, loss: torch.Tensor):
-        """Backward pass with gradient scaling and clipping."""
-        all_params = list(self.network.parameters()) + list(self.propnet.parameters())
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(all_params, 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, 12)
-            self.optimizer.step()
-
-    def _get_encoder_features(self, data: torch.Tensor) -> torch.Tensor:
-        """Extract encoder stage 3 features via forward hook."""
-        mod = self.network.module if hasattr(self.network, "module") else self.network
-        if hasattr(mod, "_orig_mod"):
-            mod = mod._orig_mod
-
-        features = {}
-
-        def hook_fn(module, input, output):
-            features["stage3"] = output
-
-        try:
-            encoder = mod.encoder
-            n_stages = len(encoder.stages)
-            target_stage = min(3, n_stages - 1)
-            handle = encoder.stages[target_stage].register_forward_hook(hook_fn)
+            self.on_train_epoch_end(train_outputs)
 
             with torch.no_grad():
-                _ = encoder(data)
+                self.on_validation_epoch_start()
+                val_outputs = []
+                for batch_id in range(self.num_val_iterations_per_epoch):
+                    val_outputs.append(
+                        self.validation_step(next(self.dataloader_val))
+                    )
+                self.on_validation_epoch_end(val_outputs)
 
-            handle.remove()
-            return features["stage3"]
-        except Exception:
-            B = data.shape[0]
-            ch = self._get_encoder_stage3_channels()
-            spatial = [s // 8 for s in data.shape[2:]]
-            return torch.zeros(B, ch, *spatial, device=data.device)
+            self.on_epoch_end()
 
-    @torch.no_grad()
-    def _get_teacher_pred(self, data: torch.Tensor) -> torch.Tensor:
-        """Get teacher prediction for refinement."""
-        teacher_out = self.ema_teacher.forward(data)
-        if isinstance(teacher_out, (list, tuple)):
-            teacher_out = teacher_out[0]
-        return torch.sigmoid(teacher_out).detach()
+        self.on_train_end()
 
-    # ─── Override: save/load checkpoint ────────────────────────────────
+    def _box_train_step(self, batch):
+        """Training step for box-supervised data."""
+        data = batch['data']
+        target = batch['target']
 
-    def save_checkpoint(self, filename: str) -> None:
-        """Save checkpoint with PropNet and EMA teacher states."""
-        if self.local_rank == 0:
-            if not self.disable_checkpointing:
-                mod = self.network.module if hasattr(self.network, "module") else self.network
-                if hasattr(mod, "_orig_mod"):
-                    mod = mod._orig_mod
+        data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            # Deep supervision: use highest resolution only for box loss
+            target_full = target[0].to(self.device, non_blocking=True)
+        else:
+            target_full = target.to(self.device, non_blocking=True)
 
-                checkpoint = {
-                    "network_weights": mod.state_dict(),
-                    "optimizer_state": self.optimizer.state_dict(),
-                    "grad_scaler_state": self.grad_scaler.state_dict() if self.grad_scaler else None,
-                    "logging": self.logger.get_checkpoint(),
-                    "_best_ema": self._best_ema,
-                    "current_epoch": self.current_epoch,
-                    "init_args": self.my_init_kwargs,
-                    "trainer_name": self.__class__.__name__,
-                    "inference_allowed_mirroring_axes": self.inference_allowed_mirroring_axes,
-                    # LatentMask extras
-                    "propnet_state": self.propnet.state_dict() if self.propnet else None,
-                    "ema_teacher_state": self.ema_teacher.state_dict() if self.ema_teacher else None,
-                    "config": {
-                        "propnet_mode": self._propnet_mode,
-                        "use_smoothness": self._use_smoothness,
-                        "use_ema_refinement": self._use_ema_refinement,
-                        "synthetic_pattern": self._synthetic_pattern,
-                        "use_vesselness_hint": self._use_vesselness_hint,
-                    },
-                }
-                torch.save(checkpoint, filename)
+        self.optimizer.zero_grad(set_to_none=True)
 
-    def load_checkpoint(self, filename: str) -> None:
-        """Load checkpoint with PropNet and EMA teacher states."""
-        if not self.was_initialized:
-            self.initialize()
+        with (autocast(self.device.type, enabled=True)
+              if self.device.type == 'cuda' else dummy_context()):
+            output = self.network(data)
+            # Use highest resolution output for box loss
+            out_full = output[0] if isinstance(output, list) else output
 
-        checkpoint = torch.load(filename, map_location=self.device, weights_only=False)
+            # g_theta function for predict_propensity
+            if self.g_theta is not None:
+                def g_func(log_sizes):
+                    return predict_propensity(
+                        self.g_theta, log_sizes, self.g_theta_s0
+                    )
+            else:
+                def g_func(log_sizes):
+                    return np.ones_like(log_sizes)
 
-        mod = self.network.module if hasattr(self.network, "module") else self.network
-        if hasattr(mod, "_orig_mod"):
-            mod = mod._orig_mod
+            l_box, diag = compute_batch_box_loss(
+                out_full, target_full,
+                pi_hat=self.pi_hat or 0.01,
+                g_theta_func=g_func,
+                s0=self.g_theta_s0 or 0.0,
+                d_margin=self.d_margin,
+                w_max=self.w_max,
+                ipw_mode=self.ipw_mode,
+                min_cc_size=self.MIN_CC_SIZE,
+            )
 
-        mod.load_state_dict(checkpoint["network_weights"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
-        if self.grad_scaler and checkpoint.get("grad_scaler_state"):
-            self.grad_scaler.load_state_dict(checkpoint["grad_scaler_state"])
-        self.current_epoch = checkpoint["current_epoch"]
-        self._best_ema = checkpoint.get("_best_ema")
-        self.inference_allowed_mirroring_axes = checkpoint.get("inference_allowed_mirroring_axes")
-        self.logger.load_checkpoint(checkpoint["logging"])
+            l = self.lambda_box * l_box
 
-        if checkpoint.get("propnet_state") and self.propnet is not None:
-            self.propnet.load_state_dict(checkpoint["propnet_state"])
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(l).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
 
-        if checkpoint.get("ema_teacher_state") and self.ema_teacher is not None:
-            self.ema_teacher.load_state_dict(checkpoint["ema_teacher_state"])
+        return {'loss': l.detach().cpu().numpy()}
+
+    # ── Diagnostics ─────────────────────────────────────────────────────
+
+    def on_epoch_end(self):
+        super().on_epoch_end()
+        if self.current_epoch in self.DIAG_EPOCHS:
+            self._log_diagnostics()
+
+    def _log_diagnostics(self):
+        """Log weight distribution and Δ_area at checkpoint epochs."""
+        diag = {'epoch': self.current_epoch, 'lambda_box': self.lambda_box}
+
+        if self.g_theta is not None and self.ipw_mode != 'none':
+            diag['pi_hat'] = self.pi_hat
+            diag['ipw_mode'] = self.ipw_mode
+
+        self.diag_log.append(diag)
+        diag_path = os.path.join(self.output_folder, 'latentmask_diagnostics.json')
+        with open(diag_path, 'w') as f:
+            json.dump(self.diag_log, f, indent=2)
 
         self.print_to_log_file(
-            f"Loaded LatentMask checkpoint from epoch {self.current_epoch}"
+            f"  [LatentMask diag] epoch={self.current_epoch}, "
+            f"λ_box={self.lambda_box:.4f}"
         )
 
+    def on_train_end(self):
+        # Save final diagnostics
+        diag_path = os.path.join(self.output_folder,
+                                  'latentmask_diagnostics.json')
+        with open(diag_path, 'w') as f:
+            json.dump(self.diag_log, f, indent=2)
 
-# ─── Ablation variants ────────────────────────────────────────────────
+        # Save final config
+        config_path = os.path.join(self.output_folder,
+                                    'latentmask_config.json')
+        config = {
+            'ipw_mode': self.ipw_mode,
+            'steepness': self.steepness,
+            'pixel_fraction': self.pixel_fraction,
+            'warmup_epochs': self.warmup_epochs,
+            'ramp_epochs': self.ramp_epochs,
+            'lambda_box_max': self.lambda_box_max,
+            'w_max': self.w_max,
+            'd_margin': self.d_margin,
+            'pi_hat_scale': self.pi_hat_scale,
+            'pi_hat': self.pi_hat,
+            'n_pixel_keys': len(self.pixel_keys),
+            'n_box_keys': len(self.box_keys),
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
 
-
-class LatentMaskTrainer_A1_UniformPU(LatentMaskTrainer):
-    """Ablation A1: PU correction with uniform propensity e=0.5."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._propnet_mode = "uniform"
-        self._use_smoothness = False
-        self._use_ema_refinement = False
-
-
-class LatentMaskTrainer_A2_PropNetOnly(LatentMaskTrainer):
-    """Ablation A2: PU + learned PropNet, no smoothness, no EMA."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._use_smoothness = False
-        self._use_ema_refinement = False
-
-
-class LatentMaskTrainer_A3_NoRefine(LatentMaskTrainer):
-    """Ablation A3: PU + PropNet + smoothness, no EMA teacher refinement."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._use_ema_refinement = False
-
-
-# ─── Baseline trainers ────────────────────────────────────────────────
-
-
-class MixedNaiveTrainer(LatentMaskTrainer):
-    """
-    Baseline: Mixed naive — use all granularities with standard losses.
-    No PU correction, no PropNet.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._propnet_mode = "uniform"
-        self._use_smoothness = False
-        self._use_ema_refinement = False
-        self.LAMBDA_PROP = 0.0
-        self.PI_BASE = 0.0
-
-
-class nnPUSegTrainer(LatentMaskTrainer):
-    """
-    Baseline: nnPU-Seg — PU learning with uniform propensity.
-    No PropNet, no smoothness, no EMA.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._propnet_mode = "uniform"
-        self._use_smoothness = False
-        self._use_ema_refinement = False
-        self.LAMBDA_PROP = 0.0
-
-
-class MeanTeacher3DTrainer(nnUNetTrainer):
-    """
-    Baseline: Mean Teacher semi-supervised.
-    Uses pixel data + image-level data (as unlabeled).
-    EMA teacher generates pseudo-labels; consistency loss on unlabeled data.
-    """
-
-    EMA_DECAY = 0.999
-
-    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json, device)
-        self.num_epochs = 400
-        self.ema_teacher = None
-        self.rspect_manifest = os.environ.get("LATENTMASK_RSPECT_MANIFEST", "")
-        self.dataloader_unlabeled = None
-        self.unlabeled_iter = None
-
-    def initialize(self):
-        if not self.was_initialized:
-            super().initialize()
-
-    def on_train_start(self):
-        super().on_train_start()
-        self.ema_teacher = EMATeacher(self.network, decay=self.EMA_DECAY)
-        self.ema_teacher.to(self.device)
-
-        # Set up unlabeled data loader from RSPECT
-        if self.rspect_manifest and os.path.isfile(self.rspect_manifest):
-            from latentmask.data.datasets import ImageDataset
-            from torch.utils.data import DataLoader
-            patch_size = tuple(self.configuration_manager.patch_size)
-            ds = ImageDataset(manifest_csv=self.rspect_manifest, patch_size=patch_size)
-            self.dataloader_unlabeled = DataLoader(
-                ds, batch_size=2, shuffle=True, num_workers=2,
-                pin_memory=True, drop_last=True,
-            )
-            self.unlabeled_iter = itertools.cycle(self.dataloader_unlabeled)
-
-    def train_step(self, batch: dict) -> dict:
-        data = batch["data"].to(self.device, non_blocking=True)
-        target = batch["target"]
-        if isinstance(target, list):
-            target = [t.to(self.device, non_blocking=True) for t in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            l_sup = self.loss(output, target)
-
-            # Consistency on unlabeled data
-            l_consistency = torch.tensor(0.0, device=self.device)
-            if self.unlabeled_iter is not None:
-                unlabeled_batch = next(self.unlabeled_iter)
-                u_data = unlabeled_batch["data"].to(self.device, non_blocking=True)
-                u_output = self.network(u_data)
-                if isinstance(u_output, (list, tuple)):
-                    u_pred = torch.sigmoid(u_output[0])
-                else:
-                    u_pred = torch.sigmoid(u_output)
-                with torch.no_grad():
-                    t_out = self.ema_teacher.forward(u_data)
-                    if isinstance(t_out, (list, tuple)):
-                        t_pred = torch.sigmoid(t_out[0])
-                    else:
-                        t_pred = torch.sigmoid(t_out)
-                l_consistency = F.mse_loss(u_pred, t_pred)
-
-            total = l_sup + 0.5 * l_consistency
-
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(total).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            total.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-
-        self.ema_teacher.update(self.network)
-        return {"loss": total.detach().cpu().numpy()}
-
-
-class CPSTrainer(nnUNetTrainer):
-    """
-    Baseline: Cross Pseudo Supervision.
-    Two networks generate pseudo-labels for each other on unlabeled data.
-    """
-
-    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json, device)
-        self.num_epochs = 400
-        self.network2 = None
-        self.optimizer2 = None
-        self.rspect_manifest = os.environ.get("LATENTMASK_RSPECT_MANIFEST", "")
-        self.dataloader_unlabeled = None
-        self.unlabeled_iter = None
-
-    def initialize(self):
-        if not self.was_initialized:
-            super().initialize()
-            # Create second network (deep copy)
-            self.network2 = deepcopy(self.network).to(self.device)
-            self.optimizer2 = torch.optim.SGD(
-                self.network2.parameters(),
-                self.initial_lr,
-                weight_decay=self.weight_decay,
-                momentum=0.99,
-                nesterov=True,
-            )
-
-    def on_train_start(self):
-        super().on_train_start()
-        if self.rspect_manifest and os.path.isfile(self.rspect_manifest):
-            from latentmask.data.datasets import ImageDataset
-            from torch.utils.data import DataLoader
-            patch_size = tuple(self.configuration_manager.patch_size)
-            ds = ImageDataset(manifest_csv=self.rspect_manifest, patch_size=patch_size)
-            self.dataloader_unlabeled = DataLoader(
-                ds, batch_size=2, shuffle=True, num_workers=2,
-                pin_memory=True, drop_last=True,
-            )
-            self.unlabeled_iter = itertools.cycle(self.dataloader_unlabeled)
-
-    def train_step(self, batch: dict) -> dict:
-        data = batch["data"].to(self.device, non_blocking=True)
-        target = batch["target"]
-        if isinstance(target, list):
-            target = [t.to(self.device, non_blocking=True) for t in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        # --- Network 1 supervised ---
-        self.optimizer.zero_grad(set_to_none=True)
-        self.optimizer2.zero_grad(set_to_none=True)
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            out1 = self.network(data)
-            out2 = self.network2(data)
-            l_sup1 = self.loss(out1, target)
-            l_sup2 = self.loss(out2, target)
-
-            l_cps = torch.tensor(0.0, device=self.device)
-            if self.unlabeled_iter is not None:
-                ub = next(self.unlabeled_iter)
-                u_data = ub["data"].to(self.device, non_blocking=True)
-                u_out1 = self.network(u_data)
-                u_out2 = self.network2(u_data)
-                if isinstance(u_out1, (list, tuple)):
-                    u_pred1, u_pred2 = torch.sigmoid(u_out1[0]), torch.sigmoid(u_out2[0])
-                else:
-                    u_pred1, u_pred2 = torch.sigmoid(u_out1), torch.sigmoid(u_out2)
-
-                pseudo1 = (u_pred1.detach() > 0.5).float()
-                pseudo2 = (u_pred2.detach() > 0.5).float()
-                l_cps = (
-                    F.binary_cross_entropy(u_pred1, pseudo2)
-                    + F.binary_cross_entropy(u_pred2, pseudo1)
-                ) * 0.5
-
-            total = l_sup1 + l_sup2 + l_cps
-
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(total).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            self.grad_scaler.unscale_(self.optimizer2)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            torch.nn.utils.clip_grad_norm_(self.network2.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.step(self.optimizer2)
-            self.grad_scaler.update()
-        else:
-            total.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            torch.nn.utils.clip_grad_norm_(self.network2.parameters(), 12)
-            self.optimizer.step()
-            self.optimizer2.step()
-
-        return {"loss": total.detach().cpu().numpy()}
-
-
-class BoxSup3DTrainer(nnUNetTrainer):
-    """
-    Baseline: 3D BoxSup — bounding box supervision with GrabCut-style pseudo-masks.
-    Uses box annotations from Aug-RSPECT. Inside box = positive, outside = negative.
-    """
-
-    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json, device)
-        self.num_epochs = 400
-        self.aug_rspect_manifest = os.environ.get("LATENTMASK_AUG_RSPECT_MANIFEST", "")
-        self.dataloader_box = None
-        self.box_iter = None
-
-    def on_train_start(self):
-        super().on_train_start()
-        if self.aug_rspect_manifest and os.path.isfile(self.aug_rspect_manifest):
-            from latentmask.data.datasets import BoxDataset
-            from torch.utils.data import DataLoader
-            patch_size = tuple(self.configuration_manager.patch_size)
-            ds = BoxDataset(manifest_csv=self.aug_rspect_manifest, patch_size=patch_size)
-            self.dataloader_box = DataLoader(
-                ds, batch_size=1, shuffle=True, num_workers=2,
-                pin_memory=True, drop_last=True,
-            )
-            self.box_iter = itertools.cycle(self.dataloader_box)
-
-    def train_step(self, batch: dict) -> dict:
-        data = batch["data"].to(self.device, non_blocking=True)
-        target = batch["target"]
-        if isinstance(target, list):
-            target = [t.to(self.device, non_blocking=True) for t in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            l_sup = self.loss(output, target)
-
-            # Box supervision: use box target as pseudo-mask
-            l_box = torch.tensor(0.0, device=self.device)
-            if self.box_iter is not None:
-                bb = next(self.box_iter)
-                b_data = bb["data"].to(self.device, non_blocking=True)
-                b_target = bb["target"].to(self.device, non_blocking=True)
-                b_output = self.network(b_data)
-                if isinstance(b_output, (list, tuple)):
-                    b_pred = torch.sigmoid(b_output[0])
-                else:
-                    b_pred = torch.sigmoid(b_output)
-                if b_pred.shape != b_target.shape:
-                    b_target = F.interpolate(
-                        b_target.float(), size=b_pred.shape[2:], mode="nearest"
-                    )
-                l_box = F.binary_cross_entropy(b_pred, b_target.float())
-
-            total = l_sup + l_box
-
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(total).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            total.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-
-        return {"loss": total.detach().cpu().numpy()}
-
-    def initialize(self):
-        super().initialize()
-        self.apn = ConstantPropensity(value=0.5).to(self.device)
-        self.optimizer, self.lr_scheduler = self.configure_optimizers()
+        super().on_train_end()

@@ -1,279 +1,99 @@
-"""
-Evaluation metrics for LatentMask.
-
-Includes:
-  - Dice coefficient
-  - Hausdorff distance 95th percentile
-  - Lesion-level F1 (connected component matching)
-  - Small-lesion recall
-  - False positives per scan
-  - Propensity calibration ECE
-  - Bootstrap significance test
-"""
-
-from __future__ import annotations
-
+"""Size-stratified evaluation metrics for box-supervised segmentation."""
+import json
 import numpy as np
 from scipy import ndimage
-from scipy.spatial.distance import directed_hausdorff
 
 
-# ─── Voxel-level metrics ──────────────────────────────────────────────
-
-def dice_coefficient(pred: np.ndarray, gt: np.ndarray) -> float:
-    """Binary Dice coefficient."""
-    pred = (pred > 0).astype(bool)
-    gt = (gt > 0).astype(bool)
-    intersection = np.logical_and(pred, gt).sum()
-    if pred.sum() + gt.sum() == 0:
-        return 1.0
-    return 2.0 * intersection / (pred.sum() + gt.sum())
+def compute_dice(pred, gt, eps=1e-7):
+    """Dice coefficient between two binary masks."""
+    intersection = (pred & gt).sum()
+    return float(2 * intersection / (pred.sum() + gt.sum() + eps))
 
 
-def hausdorff_95(pred: np.ndarray, gt: np.ndarray, spacing: tuple = (1, 1, 1)) -> float:
-    """Hausdorff distance at 95th percentile."""
-    pred = (pred > 0).astype(bool)
-    gt = (gt > 0).astype(bool)
-
-    if pred.sum() == 0 and gt.sum() == 0:
-        return 0.0
-    if pred.sum() == 0 or gt.sum() == 0:
-        return np.inf
-
-    pred_coords = np.argwhere(pred) * np.array(spacing)
-    gt_coords = np.argwhere(gt) * np.array(spacing)
-
-    # Forward distances (pred → gt)
-    from scipy.spatial import cKDTree
-    tree_gt = cKDTree(gt_coords)
-    dists_pred, _ = tree_gt.query(pred_coords)
-
-    tree_pred = cKDTree(pred_coords)
-    dists_gt, _ = tree_pred.query(gt_coords)
-
-    return max(np.percentile(dists_pred, 95), np.percentile(dists_gt, 95))
-
-
-# ─── Lesion-level metrics ─────────────────────────────────────────────
-
-def lesion_level_metrics(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    iou_threshold: float = 0.1,
-    small_vol_threshold: int = 100,
-) -> dict:
-    """
-    Compute lesion-level TP, FP, FN, F1, and small-lesion recall.
-
-    A predicted lesion is TP if it overlaps any GT lesion with IoU ≥ threshold.
-    A GT lesion is detected if any predicted lesion overlaps it with IoU ≥ threshold.
+def compute_size_stratified_metrics(pred, gt, n_quintiles=5):
+    """Compute per-CC recall stratified by object size.
 
     Args:
-        pred: Binary prediction mask.
-        gt: Binary ground truth mask.
-        iou_threshold: Minimum IoU for a match.
-        small_vol_threshold: Max voxels for a "small" lesion.
+        pred: binary prediction mask (3D numpy array).
+        gt: binary ground truth mask (3D numpy array).
+        n_quintiles: number of size groups.
 
     Returns:
-        Dict with keys: tp, fp, fn, f1, recall, precision,
-        recall_small, num_gt, num_pred, num_gt_small
+        dict with 'overall_dice', 'per_quintile' (list of dicts),
+        'quintile_boundaries'.
     """
-    pred_labels, num_pred = ndimage.label(pred > 0)
-    gt_labels, num_gt = ndimage.label(gt > 0)
+    labeled_gt, num_gt = ndimage.label(gt > 0)
+    if num_gt == 0:
+        return {'overall_dice': compute_dice(pred > 0, gt > 0),
+                'per_quintile': [], 'quintile_boundaries': []}
 
-    # GT lesion sizes
-    gt_sizes = ndimage.sum(gt > 0, gt_labels, range(1, num_gt + 1))
+    # Collect CC sizes
+    cc_sizes = []
+    cc_labels = []
+    for i in range(1, num_gt + 1):
+        size = int((labeled_gt == i).sum())
+        cc_sizes.append(size)
+        cc_labels.append(i)
 
-    # Match predicted → GT
-    pred_matched = set()
-    gt_matched = set()
+    cc_sizes = np.array(cc_sizes)
+    cc_labels = np.array(cc_labels)
+    sort_idx = np.argsort(cc_sizes)
+    cc_sizes = cc_sizes[sort_idx]
+    cc_labels = cc_labels[sort_idx]
 
-    for p_id in range(1, num_pred + 1):
-        pred_mask = pred_labels == p_id
-        for g_id in range(1, num_gt + 1):
-            gt_mask = gt_labels == g_id
-            intersection = np.logical_and(pred_mask, gt_mask).sum()
-            union = np.logical_or(pred_mask, gt_mask).sum()
-            if union > 0 and intersection / union >= iou_threshold:
-                pred_matched.add(p_id)
-                gt_matched.add(g_id)
-
-    tp = len(pred_matched)
-    fp = num_pred - tp
-    fn = num_gt - len(gt_matched)
-
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-
-    # Small-lesion recall
-    num_gt_small = 0
-    gt_small_matched = 0
-    for g_id in range(1, num_gt + 1):
-        if gt_sizes[g_id - 1] <= small_vol_threshold:
-            num_gt_small += 1
-            if g_id in gt_matched:
-                gt_small_matched += 1
-
-    recall_small = gt_small_matched / max(num_gt_small, 1)
-
-    return {
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "f1": f1,
-        "recall": recall,
-        "precision": precision,
-        "recall_small": recall_small,
-        "num_gt": num_gt,
-        "num_pred": num_pred,
-        "num_gt_small": num_gt_small,
-        "fp_per_scan": fp,
-    }
-
-
-# ─── Propensity calibration ───────────────────────────────────────────
-
-def propensity_calibration_ece(
-    predicted_propensity: np.ndarray,
-    true_propensity: np.ndarray,
-    n_bins: int = 10,
-) -> float:
-    """
-    Expected Calibration Error for propensity estimation.
-
-    Bins predicted propensity and measures mean absolute error within each bin.
-    """
-    bins = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    total = predicted_propensity.size
-
-    for i in range(n_bins):
-        mask = (predicted_propensity >= bins[i]) & (predicted_propensity < bins[i + 1])
-        if mask.sum() == 0:
+    # Split into quintiles
+    boundaries = np.quantile(cc_sizes, np.linspace(0, 1, n_quintiles + 1))
+    per_quintile = []
+    for q in range(n_quintiles):
+        lo = boundaries[q]
+        hi = boundaries[q + 1] if q < n_quintiles - 1 else cc_sizes.max() + 1
+        mask = (cc_sizes >= lo) & (cc_sizes < hi) if q < n_quintiles - 1 \
+            else (cc_sizes >= lo)
+        q_labels = cc_labels[mask]
+        if len(q_labels) == 0:
+            per_quintile.append({'quintile': f'Q{q+1}', 'n_ccs': 0,
+                                 'recall': 0.0, 'mean_size': 0.0})
             continue
-        bin_pred = predicted_propensity[mask].mean()
-        bin_true = true_propensity[mask].mean()
-        ece += mask.sum() / total * abs(bin_pred - bin_true)
 
-    return ece
+        # Per-CC recall: fraction of GT CC voxels recovered
+        recalls = []
+        for lab in q_labels:
+            gt_cc = labeled_gt == lab
+            rec = float((pred[gt_cc] > 0).sum() / gt_cc.sum())
+            recalls.append(rec)
 
-
-def propensity_by_branch_level(
-    predicted_propensity: np.ndarray,
-    vesselness: np.ndarray,
-    thresholds: tuple = (0.6, 0.3, 0.1),
-) -> dict:
-    """
-    Report mean propensity stratified by vessel branch level.
-
-    Uses vesselness as proxy for branch level:
-        vesselness ≥ 0.6 → proximal
-        0.3 ≤ vesselness < 0.6 → segmental
-        0.1 ≤ vesselness < 0.3 → subsegmental
-        vesselness < 0.1 → background
-    """
-    t_prox, t_seg, t_sub = thresholds
-    levels = {
-        "proximal": vesselness >= t_prox,
-        "segmental": (vesselness >= t_seg) & (vesselness < t_prox),
-        "subsegmental": (vesselness >= t_sub) & (vesselness < t_seg),
-        "background": vesselness < t_sub,
-    }
-
-    results = {}
-    for name, mask in levels.items():
-        if mask.sum() > 0:
-            results[name] = {
-                "mean_propensity": float(predicted_propensity[mask].mean()),
-                "std_propensity": float(predicted_propensity[mask].std()),
-                "n_voxels": int(mask.sum()),
-            }
-        else:
-            results[name] = {"mean_propensity": 0.0, "std_propensity": 0.0, "n_voxels": 0}
-
-    return results
-
-
-# ─── Statistical tests ────────────────────────────────────────────────
-
-def paired_bootstrap_test(
-    scores_a: list[float],
-    scores_b: list[float],
-    n_resamples: int = 10000,
-    seed: int = 42,
-) -> dict:
-    """
-    Paired bootstrap significance test.
-
-    Tests H0: mean(scores_a) ≤ mean(scores_b).
-
-    Args:
-        scores_a: Per-case metric for method A (expected to be better).
-        scores_b: Per-case metric for method B.
-        n_resamples: Number of bootstrap iterations.
-
-    Returns:
-        Dict with p_value, mean_diff, ci_lower, ci_upper.
-    """
-    rng = np.random.RandomState(seed)
-    a = np.array(scores_a)
-    b = np.array(scores_b)
-    n = len(a)
-    assert len(b) == n
-
-    diffs = a - b
-    observed_diff = diffs.mean()
-
-    boot_diffs = []
-    for _ in range(n_resamples):
-        idx = rng.randint(0, n, size=n)
-        boot_diffs.append(diffs[idx].mean())
-
-    boot_diffs = np.array(boot_diffs)
-    p_value = (boot_diffs <= 0).mean()
+        per_quintile.append({
+            'quintile': f'Q{q+1}',
+            'n_ccs': int(len(q_labels)),
+            'recall': float(np.mean(recalls)),
+            'mean_size': float(cc_sizes[mask].mean()),
+        })
 
     return {
-        "p_value": float(p_value),
-        "mean_diff": float(observed_diff),
-        "ci_lower": float(np.percentile(boot_diffs, 2.5)),
-        "ci_upper": float(np.percentile(boot_diffs, 97.5)),
+        'overall_dice': compute_dice(pred > 0, gt > 0),
+        'per_quintile': per_quintile,
+        'quintile_boundaries': boundaries.tolist(),
     }
 
 
-# ─── Aggregate evaluation ─────────────────────────────────────────────
+def compute_delta_area(pred_masses, true_sizes, g_theta_func):
+    """Compute Δ_area: mean |g_θ(log(mass)) - g_θ(log(true_size))|.
 
-def evaluate_case(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    spacing: tuple = (1, 1, 1),
-    small_vol_threshold: int = 100,
-) -> dict:
-    """Run all metrics on a single case. Returns a flat dict."""
-    result = {}
-    result["dice"] = dice_coefficient(pred, gt)
-    result["hd95"] = hausdorff_95(pred, gt, spacing)
+    Args:
+        pred_masses: array of predicted soft masses per box.
+        true_sizes: array of true CC sizes per box.
+        g_theta_func: callable, isotonic calibrator.
 
-    lesion = lesion_level_metrics(pred, gt, small_vol_threshold=small_vol_threshold)
-    result.update({f"lesion_{k}": v for k, v in lesion.items()})
-
-    return result
+    Returns:
+        float: mean absolute gap.
+    """
+    log_mass = np.log(np.maximum(pred_masses, 1))
+    log_true = np.log(np.maximum(true_sizes, 1))
+    gap = np.abs(g_theta_func(log_mass) - g_theta_func(log_true))
+    return float(gap.mean())
 
 
-def aggregate_results(case_results: list[dict]) -> dict:
-    """Aggregate per-case results into mean ± std."""
-    if not case_results:
-        return {}
-
-    keys = case_results[0].keys()
-    agg = {}
-    for k in keys:
-        vals = [r[k] for r in case_results if np.isfinite(r[k])]
-        if vals:
-            agg[f"{k}_mean"] = float(np.mean(vals))
-            agg[f"{k}_std"] = float(np.std(vals))
-        else:
-            agg[f"{k}_mean"] = float("nan")
-            agg[f"{k}_std"] = float("nan")
-
-    return agg
+def save_results(results, path):
+    """Save results dict to JSON."""
+    with open(path, 'w') as f:
+        json.dump(results, f, indent=2, default=lambda x: float(x))

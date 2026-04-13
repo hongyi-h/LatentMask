@@ -47,6 +47,7 @@ class LatentMaskTrainer(nnUNetTrainer):
     D_MARGIN = 5               # safe zone margin in voxels
     PI_HAT_SCALE = 1.0         # multiplier for π̂ (for sensitivity ablation)
     MIN_CC_SIZE = 10           # minimum CC size to consider
+    FG_LABEL = 2               # foreground label for CC extraction (2=tumor for LiTS)
     DIAG_EPOCHS = [50, 100, 150, 200, 250, 300]  # when to log diagnostics
 
     def __init__(self, plans, configuration, fold, dataset_json,
@@ -252,10 +253,14 @@ class LatentMaskTrainer(nnUNetTrainer):
                 self.preprocessed_dataset_folder, [key],
             ).load_case(key)
             seg_np = seg[0]  # shape (D, H, W)
-            ccs = extract_connected_components(seg_np, min_size=self.MIN_CC_SIZE)
+            ccs = extract_connected_components(seg_np, min_size=self.MIN_CC_SIZE,
+                                                fg_label=self.FG_LABEL)
             for cc in ccs:
                 all_log_sizes.append(cc['log_size'])
-            all_fg_counts.append(int((seg_np > 0).sum()))
+            if self.FG_LABEL is not None:
+                all_fg_counts.append(int((seg_np == self.FG_LABEL).sum()))
+            else:
+                all_fg_counts.append(int((seg_np > 0).sum()))
             all_total_counts.append(int(seg_np.size))
 
         # Estimate π̂
@@ -374,21 +379,21 @@ class LatentMaskTrainer(nnUNetTrainer):
 
         self.optimizer.zero_grad(set_to_none=True)
 
+        # g_theta function for predict_propensity (CPU-only, define outside autocast)
+        if self.g_theta is not None:
+            def g_func(log_sizes):
+                return predict_propensity(
+                    self.g_theta, log_sizes, self.g_theta_s0
+                )
+        else:
+            def g_func(log_sizes):
+                return np.ones_like(log_sizes)
+
         with (autocast(self.device.type, enabled=True)
               if self.device.type == 'cuda' else dummy_context()):
             output = self.network(data)
             # Use highest resolution output for box loss
             out_full = output[0] if isinstance(output, list) else output
-
-            # g_theta function for predict_propensity
-            if self.g_theta is not None:
-                def g_func(log_sizes):
-                    return predict_propensity(
-                        self.g_theta, log_sizes, self.g_theta_s0
-                    )
-            else:
-                def g_func(log_sizes):
-                    return np.ones_like(log_sizes)
 
             l_box, diag = compute_batch_box_loss(
                 out_full, target_full,
@@ -399,6 +404,7 @@ class LatentMaskTrainer(nnUNetTrainer):
                 w_max=self.w_max,
                 ipw_mode=self.ipw_mode,
                 min_cc_size=self.MIN_CC_SIZE,
+                fg_label=self.FG_LABEL,
             )
 
             l = self.lambda_box * l_box

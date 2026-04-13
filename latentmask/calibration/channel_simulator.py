@@ -59,7 +59,8 @@ def simulate_channel(ccs, g_true, rng=None):
     return selected_indices, selection_flags
 
 
-def generate_box_annotations(seg, g_true, d_margin=5, rng=None, min_cc_size=10):
+def generate_box_annotations(seg, g_true, d_margin=5, rng=None, min_cc_size=10,
+                              fg_label=None):
     """Full pipeline: mask -> CCs -> channel -> box annotations.
 
     Args:
@@ -68,6 +69,7 @@ def generate_box_annotations(seg, g_true, d_margin=5, rng=None, min_cc_size=10):
         d_margin: safe zone margin in voxels.
         rng: numpy random generator.
         min_cc_size: minimum CC size to consider.
+        fg_label: if set, only this label value is treated as foreground.
 
     Returns:
         dict with keys:
@@ -80,11 +82,15 @@ def generate_box_annotations(seg, g_true, d_margin=5, rng=None, min_cc_size=10):
     from latentmask.utils.cc_extraction import extract_connected_components
     from scipy import ndimage
 
-    ccs = extract_connected_components(seg, min_size=min_cc_size)
+    ccs = extract_connected_components(seg, min_size=min_cc_size,
+                                       fg_label=fg_label)
     selected_idx, _ = simulate_channel(ccs, g_true, rng=rng)
 
     # Build observed segmentation: only selected CCs visible
-    binary = (seg > 0).astype(np.int32)
+    if fg_label is not None:
+        binary = (seg == fg_label).astype(np.int32)
+    else:
+        binary = (seg > 0).astype(np.int32)
     labeled, _ = ndimage.label(binary)
     observed_seg = np.zeros_like(seg)
     boxes = []

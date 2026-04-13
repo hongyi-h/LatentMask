@@ -6,6 +6,8 @@ from scipy import ndimage
 
 def compute_dice(pred, gt, eps=1e-7):
     """Dice coefficient between two binary masks."""
+    pred = np.asarray(pred, dtype=bool)
+    gt = np.asarray(gt, dtype=bool)
     intersection = (pred & gt).sum()
     return float(2 * intersection / (pred.sum() + gt.sum() + eps))
 

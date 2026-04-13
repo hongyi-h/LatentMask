@@ -94,9 +94,6 @@ def main():
     plans = load_json(join(preprocessed_folder, 'nnUNetPlans.json'))
     dataset_json = load_json(join(preprocessed_folder, 'dataset.json'))
 
-    # Add continue_training flag (nnUNet expects this)
-    plans['continue_training'] = False
-
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
     # Log configuration

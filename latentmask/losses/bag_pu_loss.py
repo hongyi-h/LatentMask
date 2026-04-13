@@ -113,7 +113,8 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
             safe_loss = -torch.log((1 - f_safe).clamp(min=eps)).mean()
 
     # nnPU clipping
-    nnpu_neg = torch.clamp(safe_loss - pi_hat * neg_loss, min=0)
+    raw_neg = safe_loss - pi_hat * neg_loss
+    nnpu_neg = torch.clamp(raw_neg, min=0)
     total = pi_hat * pos_loss + nnpu_neg
 
     diagnostics = {
@@ -126,6 +127,8 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
         'safe_loss': safe_loss.item(),
         'pos_loss': (pi_hat * pos_loss).item(),
         'neg_loss': neg_loss.item(),
+        'nnpu_clipped': bool(raw_neg.item() < 0),
+        'nnpu_raw_neg': raw_neg.item(),
     }
 
     return total, diagnostics
@@ -133,7 +136,7 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
 
 def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
                            d_margin=5, w_max=10.0, ipw_mode='channel',
-                           min_cc_size=10):
+                           min_cc_size=10, fg_label=None):
     """Compute box loss over a batch by extracting CCs from the target.
 
     This is the simplified M0-ready version: CCs are extracted from the
@@ -150,6 +153,8 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
         w_max: max IPW weight.
         ipw_mode: 'channel' | 'uniform' | 'oracle'.
         min_cc_size: minimum CC size to form a box.
+        fg_label: if set, only this label is treated as foreground for CC
+                  extraction and safe zone computation.
 
     Returns:
         loss: scalar tensor.
@@ -162,10 +167,14 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
 
     # Foreground probabilities from logits
     probs = torch.softmax(output.float(), dim=1)
-    # Foreground = 1 - background (class 0)
-    fg_probs = 1 - probs[:, 0]  # shape (B, D, H, W)
+    if fg_label is not None and fg_label < probs.shape[1]:
+        # Use only the target class probability (e.g. tumor = class 2)
+        fg_probs = probs[:, fg_label]  # shape (B, D, H, W)
+    else:
+        # Binary case: foreground = 1 - P(background)
+        fg_probs = 1 - probs[:, 0]  # shape (B, D, H, W)
 
-    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    total_loss = torch.tensor(0.0, device=device)
     all_diag = []
     n_valid = 0
 
@@ -173,7 +182,8 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
         seg_np = target[b, 0].cpu().numpy().astype(np.int32)
 
         # Extract CCs from this patch
-        ccs = extract_ccs_from_patch(seg_np, min_size=min_cc_size)
+        ccs = extract_ccs_from_patch(seg_np, min_size=min_cc_size,
+                                     fg_label=fg_label)
         if len(ccs) == 0:
             continue
 
@@ -186,7 +196,7 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
             })
 
         # Safe zone
-        safe_np = compute_safe_zone_mask(seg_np, d_margin)
+        safe_np = compute_safe_zone_mask(seg_np, d_margin, fg_label=fg_label)
         safe_mask = torch.from_numpy(safe_np).to(device)
 
         # Compute loss for this sample
@@ -213,5 +223,7 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
         if ws:
             batch_diag['w_mean'] = float(np.mean(ws))
             batch_diag['w_std'] = float(np.mean([d.get('w_std', 0) for d in all_diag]))
+        clipped = [d.get('nnpu_clipped', False) for d in all_diag]
+        batch_diag['nnpu_clip_rate'] = float(np.mean(clipped))
 
     return total_loss, batch_diag

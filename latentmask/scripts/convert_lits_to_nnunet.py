@@ -114,10 +114,13 @@ def convert(input_dir, output_dir):
         out_vol = os.path.join(images_dir, f'{case_id}_0000.nii.gz')
         nib.save(vol_nii, out_vol)
 
-        # Load and save segmentation
+        # Load segmentation and align spatial metadata to volume
         seg_nii = nib.load(seg_path)
+        seg_data = seg_nii.get_fdata().astype(np.uint8)
+        # Copy affine and header from the CT volume so spacing/origin/direction match
+        seg_aligned = nib.Nifti1Image(seg_data, vol_nii.affine, vol_nii.header)
         out_seg = os.path.join(labels_dir, f'{case_id}.nii.gz')
-        nib.save(seg_nii, out_seg)
+        nib.save(seg_aligned, out_seg)
 
         training_list.append({
             'image': f'./imagesTr/{case_id}_0000.nii.gz',

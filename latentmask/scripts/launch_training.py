@@ -124,6 +124,10 @@ def main():
     )
     trainer.num_epochs = args.num_epochs
 
+    # Disambiguate output folder by ipw_mode / steepness / seed
+    suffix = f"{args.ipw_mode}_{args.steepness}_seed{args.seed}"
+    trainer.output_folder = join(trainer.output_folder, suffix)
+
     # Save run config
     os.makedirs(trainer.output_folder, exist_ok=True)
     config_path = join(trainer.output_folder, 'run_config.json')

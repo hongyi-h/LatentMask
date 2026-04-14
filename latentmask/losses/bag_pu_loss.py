@@ -174,7 +174,7 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
         # Binary case: foreground = 1 - P(background)
         fg_probs = 1 - probs[:, 0]  # shape (B, D, H, W)
 
-    total_loss = torch.tensor(0.0, device=device)
+    total_loss = (output * 0).sum()  # differentiable zero tied to output
     all_diag = []
     n_valid = 0
 

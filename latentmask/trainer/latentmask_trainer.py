@@ -409,6 +409,10 @@ class LatentMaskTrainer(nnUNetTrainer):
 
             l = self.lambda_box * l_box
 
+        if not l.requires_grad:
+            # No boxes found in this batch — skip update
+            return {'loss': 0.0}
+
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)

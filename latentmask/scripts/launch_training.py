@@ -131,7 +131,7 @@ def main():
     # Re-bind logger to new output_folder (nnUNet binds in __init__ before we override)
     os.makedirs(trainer.output_folder, exist_ok=True)
     from datetime import datetime
-    from nnunetv2.utilities.logging.nnunet_logger import MetaLogger
+    from nnunetv2.training.logging.nnunet_logger import MetaLogger
     timestamp = datetime.now()
     trainer.log_file = join(trainer.output_folder,
                             "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %

@@ -102,10 +102,11 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
     if len(pos_terms) == 0:
         return torch.tensor(0.0, device=device, requires_grad=True), {'n_boxes': 0}
 
-    pos_loss = torch.stack(pos_terms).sum()
-    neg_loss = torch.stack(neg_terms).sum()
+    n_boxes = len(pos_terms)
+    pos_loss = torch.stack(pos_terms).sum() / n_boxes   # mean, not sum
+    neg_loss = torch.stack(neg_terms).sum() / n_boxes   # mean, not sum
 
-    # Safe zone loss
+    # Safe zone loss (already a mean)
     safe_loss = torch.tensor(0.0, device=device)
     if safe_mask.any():
         f_safe = fg_probs[safe_mask > 0]
@@ -118,7 +119,7 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
     total = pi_hat * pos_loss + nnpu_neg
 
     diagnostics = {
-        'n_boxes': len(pos_terms),
+        'n_boxes': n_boxes,
         'w_mean': float(np.mean(weights_list)),
         'w_std': float(np.std(weights_list)),
         'w_max_actual': float(max(weights_list)),

@@ -128,8 +128,18 @@ def main():
     suffix = f"{args.ipw_mode}_{args.steepness}_seed{args.seed}"
     trainer.output_folder = join(trainer.output_folder, suffix)
 
-    # Save run config
+    # Re-bind logger to new output_folder (nnUNet binds in __init__ before we override)
     os.makedirs(trainer.output_folder, exist_ok=True)
+    from datetime import datetime
+    from nnunetv2.utilities.logging.nnunet_logger import MetaLogger
+    timestamp = datetime.now()
+    trainer.log_file = join(trainer.output_folder,
+                            "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
+                            (timestamp.year, timestamp.month, timestamp.day,
+                             timestamp.hour, timestamp.minute, timestamp.second))
+    trainer.logger = MetaLogger(trainer.output_folder, False)
+
+    # Save run config
     config_path = join(trainer.output_folder, 'run_config.json')
     with open(config_path, 'w') as f:
         json.dump(run_config, f, indent=2)

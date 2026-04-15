@@ -84,6 +84,7 @@ class LatentMaskTrainer(nnUNetTrainer):
         self.box_annotations = {}  # key -> list of box dicts
         self.dataloader_box = None
         self.diag_log = []
+        self._epoch_box_diags = []  # accumulate per-batch box diagnostics
 
         if self.ipw_mode == 'none':
             self.warmup_epochs = self.num_epochs  # never use box loss
@@ -320,6 +321,7 @@ class LatentMaskTrainer(nnUNetTrainer):
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
         self.lambda_box = self._get_lambda_box()
+        self._epoch_box_diags = []  # reset per-epoch
         self.print_to_log_file(f"  λ_box = {self.lambda_box:.4f}")
 
     # ── Training loop ───────────────────────────────────────────────────
@@ -379,8 +381,11 @@ class LatentMaskTrainer(nnUNetTrainer):
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        # g_theta function for predict_propensity (CPU-only, define outside autocast)
-        if self.g_theta is not None:
+        # g function for IPW weights (CPU-only, define outside autocast)
+        if self.ipw_mode == 'oracle' and self.g_true is not None:
+            # Oracle upper bound: use true channel function directly
+            g_func = self.g_true
+        elif self.g_theta is not None:
             def g_func(log_sizes):
                 return predict_propensity(
                     self.g_theta, log_sizes, self.g_theta_s0
@@ -408,6 +413,10 @@ class LatentMaskTrainer(nnUNetTrainer):
             )
 
             l = self.lambda_box * l_box
+
+        # Accumulate box diagnostics for epoch-level logging
+        if diag.get('n_samples_with_boxes', 0) > 0:
+            self._epoch_box_diags.append(diag)
 
         if not l.requires_grad:
             # No boxes found in this batch — skip update
@@ -440,6 +449,19 @@ class LatentMaskTrainer(nnUNetTrainer):
         if self.g_theta is not None and self.ipw_mode != 'none':
             diag['pi_hat'] = self.pi_hat
             diag['ipw_mode'] = self.ipw_mode
+
+        # Aggregate box step weight stats from this epoch
+        if self._epoch_box_diags:
+            ws = [d['w_mean'] for d in self._epoch_box_diags if 'w_mean' in d]
+            if ws:
+                diag['w_mean'] = float(np.mean(ws))
+                diag['w_std'] = float(np.mean(
+                    [d.get('w_std', 0) for d in self._epoch_box_diags]))
+            diag['n_box_steps'] = len(self._epoch_box_diags)
+            diag['total_boxes'] = sum(
+                d.get('total_boxes', 0) for d in self._epoch_box_diags)
+            diag['nnpu_clip_rate'] = float(np.mean(
+                [d.get('nnpu_clip_rate', 0) for d in self._epoch_box_diags]))
 
         self.diag_log.append(diag)
         diag_path = os.path.join(self.output_folder, 'latentmask_diagnostics.json')

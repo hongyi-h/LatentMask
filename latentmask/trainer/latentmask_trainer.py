@@ -31,7 +31,7 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from latentmask.losses.bag_pu_loss import compute_batch_box_loss
 from latentmask.calibration.isotonic_fit import fit_isotonic, predict_propensity
 from latentmask.calibration.channel_simulator import make_channel_func, generate_box_annotations
-from latentmask.utils.cc_extraction import extract_connected_components
+from latentmask.utils.cc_extraction import extract_connected_components, compute_safe_zone_mask
 
 
 class LatentMaskTrainer(nnUNetTrainer):
@@ -294,10 +294,34 @@ class LatentMaskTrainer(nnUNetTrainer):
         self.g_theta, self.g_theta_s0 = fit_isotonic(all_log_sizes, selection)
         self.print_to_log_file(f"  g_θ fitted: s0={self.g_theta_s0:.2f}")
 
+        # ── Measure η_safe (safe-zone contamination rate) ──────────
+        safe_fg_total = 0
+        safe_total = 0
+        for key in self.pixel_keys:
+            data, seg, _, props = self.dataset_class(
+                self.preprocessed_dataset_folder, [key],
+            ).load_case(key)
+            seg_np = seg[0]
+            safe_mask = compute_safe_zone_mask(seg_np, self.d_margin,
+                                               fg_label=self.FG_LABEL)
+            if self.FG_LABEL is not None:
+                fg_in_safe = int(((seg_np == self.FG_LABEL) & (safe_mask > 0)).sum())
+            else:
+                fg_in_safe = int(((seg_np > 0) & (safe_mask > 0)).sum())
+            safe_fg_total += fg_in_safe
+            safe_total += int(safe_mask.sum())
+
+        self.eta_safe = safe_fg_total / max(safe_total, 1)
+        self.print_to_log_file(
+            f"  η_safe = {self.eta_safe:.6f} "
+            f"({safe_fg_total} fg voxels in {safe_total} safe voxels)"
+        )
+
         # Save calibration results
         calib_path = os.path.join(self.output_folder, 'calibration_prefit.json')
         calib_results = {
             'pi_hat': self.pi_hat,
+            'eta_safe': self.eta_safe,
             'mu': mu,
             's0': self.g_theta_s0,
             'n_ccs': len(all_log_sizes),

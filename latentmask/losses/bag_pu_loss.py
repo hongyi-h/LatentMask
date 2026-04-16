@@ -1,16 +1,16 @@
-"""Bag-level box loss with inverse-propensity weighting.
+"""IPW-corrected box supervision loss (Horvitz-Thompson / Hájek estimator).
 
-Implements:
-  L_box = mean_j[ w̃_j · (-log p_j) ] + safe_loss
+Implements (FINAL_PROPOSAL §4.4):
+  L_box = R̂_Hájek + L_safe
+        = mean_j[ w̃_j · (-log p_j) ] + mean_{safe}[-log(1−f_θ)]
 
 where p_j is the bag probability (Noisy-OR, LSE, or top-k mean),
-w̃_j is the self-normalised IPW weight, and
-safe_loss = mean of −log(1−f_θ) over the safe zone (reliable negatives).
+w̃_j is the self-normalised (Hájek) IPW weight, and
+safe_loss = mean of −log(1−f_θ) over the safe zone (low-contamination negatives).
 
-The nnPU framework (Kiryo 2017) was removed because:
-  1. Bag/voxel unit mismatch: voxel prior π̂ cannot weight bag-level loss.
-  2. Noisy-OR p_j → 1 early ⇒ −log(1−p_j) → ∞ ⇒ nnPU clips 100%.
-  3. Safe zone is explicitly negative, not random unlabeled data.
+Theoretical basis: Under size-conditional ignorability (A2) and positivity (A0),
+the Hájek estimator is consistent for the population positive risk.
+See Horvitz & Thompson (1952), Hájek (1971).
 """
 import torch
 import numpy as np

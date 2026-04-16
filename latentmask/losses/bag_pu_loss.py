@@ -1,28 +1,81 @@
-"""Bag-level biased PU loss with inverse-propensity weighting.
+"""Bag-level box loss with inverse-propensity weighting.
 
-Implements L_box from FINAL_PROPOSAL §4.4:
-  L_box = π̂ · Σ_j w_j·(-log p_j)
-        + max(0, L_safe − π̂ · Σ_j w_j·(-log(1−p_j)))
+Implements:
+  L_box = mean_j[ w̃_j · (-log p_j) ] + safe_loss
 
-where p_j = 1 − Π_{i∈B_j}(1 − f_θ(x_i)) is the bag probability,
-w_j = 1/g_θ(log(mass_j)) is the IPW weight, and
-L_safe = mean of −log(1−f_θ) over the safe zone.
+where p_j is the bag probability (Noisy-OR, LSE, or top-k mean),
+w̃_j is the self-normalised IPW weight, and
+safe_loss = mean of −log(1−f_θ) over the safe zone (reliable negatives).
+
+The nnPU framework (Kiryo 2017) was removed because:
+  1. Bag/voxel unit mismatch: voxel prior π̂ cannot weight bag-level loss.
+  2. Noisy-OR p_j → 1 early ⇒ −log(1−p_j) → ∞ ⇒ nnPU clips 100%.
+  3. Safe zone is explicitly negative, not random unlabeled data.
 """
 import torch
 import numpy as np
 
 
+# ── Bag probability aggregation functions ───────────────────────────────
+
+def _bag_prob_noisy_or(f_box, eps=1e-7):
+    """Noisy-OR: p = 1 − Π(1 − f_i).  Witness-seeking (standard MIL)."""
+    log_1mf = torch.log((1 - f_box).clamp(min=eps))
+    sum_log = log_1mf.sum()
+    neg_log_p = -torch.log1p(-torch.exp(sum_log.clamp(max=-eps)))
+    return neg_log_p  # returns −log(p_j)
+
+
+def _bag_prob_lse(f_box, r=5.0, eps=1e-7):
+    """Log-Sum-Exp pooling: smooth approximation to max.
+
+    p = σ(r⁻¹ · log(mean(exp(r · logit_i))))
+    Interpolates between mean (r→0) and max (r→∞).
+    Default r=5 is moderately shape-seeking.
+    """
+    # Convert probs to logits
+    logits = torch.log(f_box.clamp(min=eps) / (1 - f_box).clamp(min=eps))
+    lse = torch.logsumexp(r * logits, dim=0) if logits.dim() == 1 else \
+          torch.logsumexp(r * logits.reshape(-1), dim=0)
+    pooled_logit = (lse - np.log(logits.numel())) / r
+    p = torch.sigmoid(pooled_logit)
+    neg_log_p = -torch.log(p.clamp(min=eps))
+    return neg_log_p
+
+
+def _bag_prob_topk(f_box, k_frac=0.1, k_min=5, eps=1e-7):
+    """Top-k mean: p = mean(top k predictions).
+
+    Shape-seeking: encourages a fraction of voxels to predict positive.
+    """
+    flat = f_box.reshape(-1)
+    k = max(k_min, int(k_frac * flat.numel()))
+    k = min(k, flat.numel())
+    topk_vals = torch.topk(flat, k).values
+    p = topk_vals.mean()
+    neg_log_p = -torch.log(p.clamp(min=eps))
+    return neg_log_p
+
+
+BAG_PROB_FN = {
+    'noisy_or': _bag_prob_noisy_or,
+    'lse': _bag_prob_lse,
+    'topk': _bag_prob_topk,
+}
+
+
 def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
                         pi_hat, g_theta_func, s0,
-                        w_max=10.0, ipw_mode='channel'):
-    """Compute the bag-level biased PU loss for one sample.
+                        w_max=10.0, ipw_mode='channel',
+                        bag_pooling='noisy_or'):
+    """Compute the bag-level box loss for one sample.
 
     Args:
         fg_probs: foreground probability map, shape (D, H, W). Detached for
                   mass computation; gradients flow through bag probability.
         boxes: list of bbox tuples ((z1,z2),(y1,y2),(x1,x2)).
         safe_mask: binary tensor (D,H,W), 1 = safe zone.
-        pi_hat: class prior estimate (scalar).
+        pi_hat: class prior estimate (scalar).  Used only for diagnostics now.
         g_theta_func: callable(log_mass_array) -> propensity_array.
                       For 'uniform' mode, this is ignored.
         s0: minimum log-size support of isotonic fit.
@@ -31,6 +84,7 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
                   'uniform': w=1 for all boxes.
                   'channel': w=1/g_θ(log(mass)).
                   'oracle': expects boxes to carry 'true_size' key.
+        bag_pooling: 'noisy_or' | 'lse' | 'topk'.  Bag probability function.
 
     Returns:
         loss: scalar tensor with gradient.
@@ -38,6 +92,7 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
     """
     device = fg_probs.device
     eps = 1e-7
+    bag_fn = BAG_PROB_FN.get(bag_pooling, _bag_prob_noisy_or)
 
     if len(boxes) == 0:
         # No boxes in this patch -> only safe zone loss
@@ -48,8 +103,7 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
         return torch.tensor(0.0, device=device, requires_grad=True), {'n_boxes': 0}
 
     pos_terms = []
-    neg_terms = []
-    weights_list = []
+    raw_weights = []
     masses_list = []
 
     for box_info in boxes:
@@ -64,16 +118,8 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
         if f_box.numel() == 0:
             continue
 
-        # Bag probability in log space
-        log_1mf = torch.log((1 - f_box).clamp(min=eps))
-        sum_log_1mf = log_1mf.sum()
-
-        # -log(p_j) = -log(1 - exp(sum_log_1mf))
-        # Use log1p(-exp(x)) for numerical stability
-        neg_log_pj = -torch.log1p(-torch.exp(sum_log_1mf.clamp(max=-eps)))
-
-        # -log(1 - p_j) = -sum_log_1mf
-        neg_log_1mpj = -sum_log_1mf
+        # Bag positive loss: −log(p_j)
+        neg_log_pj = bag_fn(f_box)
 
         # Soft positive mass (detached, no gradient)
         with torch.no_grad():
@@ -94,42 +140,45 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
         else:
             w = 1.0
 
-        pos_terms.append(w * neg_log_pj)
-        neg_terms.append(w * neg_log_1mpj)
-        weights_list.append(w)
+        pos_terms.append(neg_log_pj)  # weight applied after self-norm
+        raw_weights.append(w)
         masses_list.append(mass.item())
 
     if len(pos_terms) == 0:
         return torch.tensor(0.0, device=device, requires_grad=True), {'n_boxes': 0}
 
     n_boxes = len(pos_terms)
-    pos_loss = torch.stack(pos_terms).sum() / n_boxes   # mean, not sum
-    neg_loss = torch.stack(neg_terms).sum() / n_boxes   # mean, not sum
 
-    # Safe zone loss (already a mean)
+    # Self-normalise IPW weights so they sum to n_boxes
+    raw_w = np.array(raw_weights)
+    norm_w = raw_w * (n_boxes / raw_w.sum()) if raw_w.sum() > 0 else raw_w
+    weights_t = torch.tensor(norm_w, dtype=torch.float32, device=device)
+
+    # Weighted positive loss (IPW-corrected, self-normalised mean)
+    pos_stack = torch.stack(pos_terms)
+    pos_loss = (weights_t * pos_stack).sum() / n_boxes
+
+    # Safe zone loss: reliable-negative supervision (mean over safe voxels)
     safe_loss = torch.tensor(0.0, device=device)
     if safe_mask.any():
         f_safe = fg_probs[safe_mask > 0]
         if f_safe.numel() > 0:
             safe_loss = -torch.log((1 - f_safe).clamp(min=eps)).mean()
 
-    # nnPU clipping
-    raw_neg = safe_loss - pi_hat * neg_loss
-    nnpu_neg = torch.clamp(raw_neg, min=0)
-    total = pi_hat * pos_loss + nnpu_neg
+    # Direct supervision: positive push + negative push
+    total = pos_loss + safe_loss
 
     diagnostics = {
         'n_boxes': n_boxes,
-        'w_mean': float(np.mean(weights_list)),
-        'w_std': float(np.std(weights_list)),
-        'w_max_actual': float(max(weights_list)),
-        'w_min_actual': float(min(weights_list)),
+        'w_mean': float(np.mean(raw_weights)),
+        'w_std': float(np.std(raw_weights)),
+        'w_max_actual': float(max(raw_weights)),
+        'w_min_actual': float(min(raw_weights)),
+        'w_norm_mean': float(np.mean(norm_w)),
         'mass_mean': float(np.mean(masses_list)),
         'safe_loss': safe_loss.item(),
-        'pos_loss': (pi_hat * pos_loss).item(),
-        'neg_loss': neg_loss.item(),
-        'nnpu_clipped': bool(raw_neg.item() < 0),
-        'nnpu_raw_neg': raw_neg.item(),
+        'pos_loss': pos_loss.item(),
+        'bag_pooling': bag_pooling,
     }
 
     return total, diagnostics
@@ -137,7 +186,8 @@ def compute_bag_pu_loss(fg_probs, boxes, safe_mask,
 
 def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
                            d_margin=5, w_max=10.0, ipw_mode='channel',
-                           min_cc_size=10, fg_label=None):
+                           min_cc_size=10, fg_label=None,
+                           bag_pooling='noisy_or'):
     """Compute box loss over a batch by extracting CCs from the target.
 
     This is the simplified M0-ready version: CCs are extracted from the
@@ -156,6 +206,7 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
         min_cc_size: minimum CC size to form a box.
         fg_label: if set, only this label is treated as foreground for CC
                   extraction and safe zone computation.
+        bag_pooling: 'noisy_or' | 'lse' | 'topk'.
 
     Returns:
         loss: scalar tensor.
@@ -205,6 +256,7 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
             fg_probs[b], boxes, safe_mask,
             pi_hat, g_theta_func, s0,
             w_max=w_max, ipw_mode=ipw_mode,
+            bag_pooling=bag_pooling,
         )
 
         total_loss = total_loss + sample_loss
@@ -224,7 +276,11 @@ def compute_batch_box_loss(output, target, pi_hat, g_theta_func, s0,
         if ws:
             batch_diag['w_mean'] = float(np.mean(ws))
             batch_diag['w_std'] = float(np.mean([d.get('w_std', 0) for d in all_diag]))
-        clipped = [d.get('nnpu_clipped', False) for d in all_diag]
-        batch_diag['nnpu_clip_rate'] = float(np.mean(clipped))
+        pos = [d['pos_loss'] for d in all_diag if 'pos_loss' in d]
+        safe = [d['safe_loss'] for d in all_diag if 'safe_loss' in d]
+        if pos:
+            batch_diag['pos_loss_mean'] = float(np.mean(pos))
+        if safe:
+            batch_diag['safe_loss_mean'] = float(np.mean(safe))
 
     return total_loss, batch_diag

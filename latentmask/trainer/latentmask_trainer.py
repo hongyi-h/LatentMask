@@ -49,6 +49,7 @@ class LatentMaskTrainer(nnUNetTrainer):
     MIN_CC_SIZE = 10           # minimum CC size to consider
     FG_LABEL = 2               # foreground label for CC extraction (2=tumor for LiTS)
     DIAG_EPOCHS = [50, 100, 150, 200, 250, 300]  # when to log diagnostics
+    BAG_POOLING = 'noisy_or'   # 'noisy_or' | 'lse' | 'topk'
 
     def __init__(self, plans, configuration, fold, dataset_json,
                  device=torch.device('cuda')):
@@ -72,6 +73,7 @@ class LatentMaskTrainer(nnUNetTrainer):
         self.d_margin = int(os.environ.get('LM_D_MARGIN', self.D_MARGIN))
         self.pi_hat_scale = float(os.environ.get('LM_PI_HAT_SCALE',
                                                    self.PI_HAT_SCALE))
+        self.bag_pooling = os.environ.get('LM_BAG_POOLING', self.BAG_POOLING)
 
         # Will be set during on_train_start
         self.g_theta = None       # isotonic calibrator
@@ -410,6 +412,7 @@ class LatentMaskTrainer(nnUNetTrainer):
                 ipw_mode=self.ipw_mode,
                 min_cc_size=self.MIN_CC_SIZE,
                 fg_label=self.FG_LABEL,
+                bag_pooling=self.bag_pooling,
             )
 
             l = self.lambda_box * l_box
@@ -460,8 +463,14 @@ class LatentMaskTrainer(nnUNetTrainer):
             diag['n_box_steps'] = len(self._epoch_box_diags)
             diag['total_boxes'] = sum(
                 d.get('total_boxes', 0) for d in self._epoch_box_diags)
-            diag['nnpu_clip_rate'] = float(np.mean(
-                [d.get('nnpu_clip_rate', 0) for d in self._epoch_box_diags]))
+            pos = [d['pos_loss_mean'] for d in self._epoch_box_diags
+                   if 'pos_loss_mean' in d]
+            safe = [d['safe_loss_mean'] for d in self._epoch_box_diags
+                    if 'safe_loss_mean' in d]
+            if pos:
+                diag['pos_loss_mean'] = float(np.mean(pos))
+            if safe:
+                diag['safe_loss_mean'] = float(np.mean(safe))
 
         self.diag_log.append(diag)
         diag_path = os.path.join(self.output_folder, 'latentmask_diagnostics.json')
@@ -496,6 +505,7 @@ class LatentMaskTrainer(nnUNetTrainer):
             'pi_hat': self.pi_hat,
             'n_pixel_keys': len(self.pixel_keys),
             'n_box_keys': len(self.box_keys),
+            'bag_pooling': self.bag_pooling,
         }
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)

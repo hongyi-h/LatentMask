@@ -75,3 +75,75 @@ def compute_safe_zone_mask(seg_patch, d_margin, fg_label=None):
     fg = (seg_patch > 0).astype(np.float32)
     dist = ndimage.distance_transform_edt(1 - fg)
     return (dist >= d_margin).astype(np.float32)
+
+
+# ── v5 additions ───────────────────────────────────────────────────────
+
+def extract_prediction_ccs_v5(fg_probs_np, safe_mask_np,
+                               tau_low=0.3, tau_high=0.5, min_size=10):
+    """Extract CCs from model predictions in the safe zone (v5 protocol).
+
+    Two-threshold extraction (FINAL_PROPOSAL §4.4 Step 2):
+      1. M_low = (fg_probs > tau_low) AND safe_zone
+      2. 3D connected components on M_low
+      3. Per CC: mature if any voxel > tau_high, else nascent
+      4. Boundary check: does CC touch any patch face?
+
+    Returns:
+        ccs: list of dicts with label_id, size, mass, log_mass,
+             is_mature, touches_boundary
+        labeled: int32 array of component labels (0=background)
+    """
+    binary = ((fg_probs_np > tau_low) & (safe_mask_np > 0)).astype(np.int32)
+    labeled, num = ndimage.label(binary)
+
+    if num == 0:
+        return [], labeled
+
+    shape = fg_probs_np.shape
+    slices_list = ndimage.find_objects(labeled)
+
+    ccs = []
+    for i, slc in enumerate(slices_list):
+        if slc is None:
+            continue
+        label_id = i + 1
+        cc_mask = labeled[slc] == label_id
+        size = int(cc_mask.sum())
+        if size < min_size:
+            labeled[slc][cc_mask] = 0
+            continue
+
+        probs_in_cc = fg_probs_np[slc][cc_mask]
+        mass = float(probs_in_cc.sum())
+        is_mature = bool((probs_in_cc > tau_high).any())
+
+        touches_boundary = (
+            slc[0].start == 0 or slc[0].stop == shape[0] or
+            slc[1].start == 0 or slc[1].stop == shape[1] or
+            slc[2].start == 0 or slc[2].stop == shape[2]
+        )
+
+        ccs.append({
+            'label_id': label_id,
+            'size': size,
+            'mass': mass,
+            'log_mass': float(np.log(max(mass, 1e-6))),
+            'is_mature': is_mature,
+            'touches_boundary': touches_boundary,
+        })
+
+    return ccs, labeled
+
+
+def compute_safe_zone_from_boxes(shape, boxes, d_safe):
+    """Compute safe zone from bounding boxes using chessboard distance.
+
+    S = {u : d_chessboard(u, union(boxes)) > d_safe}
+    """
+    box_mask = np.zeros(shape, dtype=np.uint8)
+    for box in boxes:
+        (z1, z2), (y1, y2), (x1, x2) = box
+        box_mask[z1:z2, y1:y2, x1:x2] = 1
+    dist = ndimage.distance_transform_cdt(1 - box_mask, metric='chessboard')
+    return (dist > d_safe).astype(np.float32)

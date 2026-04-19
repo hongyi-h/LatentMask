@@ -99,3 +99,110 @@ def save_results(results, path):
     """Save results dict to JSON."""
     with open(path, 'w') as f:
         json.dump(results, f, indent=2, default=lambda x: float(x))
+
+
+# ── v5 additions ───────────────────────────────────────────────────────
+
+def compute_hd95(pred, gt, voxel_spacing=None):
+    """Hausdorff Distance 95th percentile between two binary masks."""
+    from scipy.ndimage import distance_transform_edt, binary_erosion
+    pred = np.asarray(pred, dtype=bool)
+    gt = np.asarray(gt, dtype=bool)
+
+    if not pred.any() or not gt.any():
+        return float('inf')
+
+    # Extract surface voxels
+    pred_border = pred ^ binary_erosion(pred)
+    gt_border = gt ^ binary_erosion(gt)
+
+    if not pred_border.any() or not gt_border.any():
+        return float('inf')
+
+    # Distance from pred surface to nearest GT surface
+    dt_gt = distance_transform_edt(~gt_border, sampling=voxel_spacing)
+    dist_pred_to_gt = dt_gt[pred_border]
+
+    # Distance from GT surface to nearest pred surface
+    dt_pred = distance_transform_edt(~pred_border, sampling=voxel_spacing)
+    dist_gt_to_pred = dt_pred[gt_border]
+
+    all_dists = np.concatenate([dist_pred_to_gt, dist_gt_to_pred])
+    return float(np.percentile(all_dists, 95))
+
+
+def compute_per_lesion_metrics(pred, gt):
+    """Compute per-GT-lesion Dice.
+
+    For each GT lesion, find the best-overlapping predicted CC and
+    compute their Dice coefficient.
+
+    Returns list of dicts with size, log_size, dice per GT lesion.
+    """
+    pred_bin = (np.asarray(pred) > 0).astype(np.int32)
+    gt_bin = (np.asarray(gt) > 0).astype(np.int32)
+    labeled_gt, num_gt = ndimage.label(gt_bin)
+    labeled_pred, num_pred = ndimage.label(pred_bin)
+
+    lesions = []
+    for i in range(1, num_gt + 1):
+        gt_cc = labeled_gt == i
+        size = int(gt_cc.sum())
+
+        # Find overlapping predicted CCs
+        pred_labels_in_gt = labeled_pred[gt_cc]
+        unique_preds = np.unique(pred_labels_in_gt)
+        unique_preds = unique_preds[unique_preds > 0]
+
+        best_dice = 0.0
+        for pl in unique_preds:
+            pred_cc = labeled_pred == pl
+            best_dice = max(best_dice, compute_dice(pred_cc, gt_cc))
+
+        lesions.append({
+            'size': size,
+            'log_size': float(np.log(max(size, 1))),
+            'dice': best_dice,
+            'detected': best_dice > 0.1,
+        })
+    return lesions
+
+
+def aggregate_lesion_metrics_by_quintile(all_lesions, n_quintiles=5):
+    """Group per-lesion metrics into quintile summaries.
+
+    Returns list of dicts per quintile with n, mean_dice, mean_size.
+    """
+    if not all_lesions:
+        return []
+
+    sizes = np.array([l['size'] for l in all_lesions])
+    sort_idx = np.argsort(sizes)
+    sorted_lesions = [all_lesions[i] for i in sort_idx]
+    sorted_sizes = sizes[sort_idx]
+
+    boundaries = np.quantile(sorted_sizes, np.linspace(0, 1, n_quintiles + 1))
+
+    results = []
+    for q in range(n_quintiles):
+        lo = boundaries[q]
+        hi = boundaries[q + 1]
+        if q < n_quintiles - 1:
+            mask = (sorted_sizes >= lo) & (sorted_sizes < hi)
+        else:
+            mask = sorted_sizes >= lo
+        q_lesions = [sorted_lesions[j] for j in range(len(sorted_lesions)) if mask[j]]
+
+        if not q_lesions:
+            results.append({'quintile': f'Q{q+1}', 'n': 0,
+                            'mean_dice': None, 'mean_size': None})
+            continue
+
+        results.append({
+            'quintile': f'Q{q+1}',
+            'n': len(q_lesions),
+            'mean_dice': float(np.mean([l['dice'] for l in q_lesions])),
+            'detection_rate': float(np.mean([l['detected'] for l in q_lesions])),
+            'mean_size': float(np.mean([l['size'] for l in q_lesions])),
+        })
+    return results

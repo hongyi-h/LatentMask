@@ -106,6 +106,10 @@ def main():
     plans = load_json(join(preprocessed_folder, 'nnUNetPlans.json'))
     dataset_json = load_json(join(preprocessed_folder, 'dataset.json'))
 
+    # nnUNet __init__ expects 'continue_training' (normally injected by CLI)
+    if 'continue_training' not in plans:
+        plans['continue_training'] = False
+
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
     # Config name for output folder

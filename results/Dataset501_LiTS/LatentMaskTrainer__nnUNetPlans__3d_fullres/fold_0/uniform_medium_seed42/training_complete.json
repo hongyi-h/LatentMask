@@ -1,0 +1,33 @@
+{
+  "status": "DONE",
+  "timestamp": "2026-04-20 23:33:27",
+  "config": {
+    "run_id": "uniform_medium_seed42",
+    "version": "v5",
+    "timestamp": "2026-04-20 23:13:44",
+    "args": {
+      "dataset_id": 501,
+      "configuration": "3d_fullres",
+      "fold": 0,
+      "seed": 42,
+      "neg_mode": "uniform",
+      "steepness": "medium",
+      "pixel_fraction": 0.3,
+      "num_epochs": 5,
+      "warmup_epochs": 50,
+      "ramp_epochs": 50,
+      "channel_neg_start": 60,
+      "lambda_box_max": 1.0,
+      "w_max": 10.0,
+      "d_margin": 5,
+      "device": "cuda",
+      "kappa": 1.0,
+      "beta_fill": 1.0,
+      "gamma_neg": 1.0,
+      "tau_low": 0.3,
+      "tau_high": 0.5,
+      "alpha_min": 0.05
+    }
+  },
+  "output_folder": "results/Dataset501_LiTS/LatentMaskTrainer__nnUNetPlans__3d_fullres/fold_0/uniform_medium_seed42"
+}

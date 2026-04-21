@@ -1,0 +1,18 @@
+[
+  {
+    "epoch": 50,
+    "lambda_box": 1.0,
+    "neg_mode": "channel",
+    "d_margin": 5,
+    "fallback_triggered": false,
+    "coverage_ratio_mean": 0.07433604255450466,
+    "nascent_ratio_mean": 0.3236193340972753,
+    "mean_alpha_mean": 0.5138056462799228,
+    "tight_loss_mean": 0.03677020947848511,
+    "fill_loss_mean": 0.05596621707856104,
+    "neg_loss_mean": 0.006833656497987891,
+    "n_box_steps": 68,
+    "total_boxes": 177,
+    "n_ccs_total": 846
+  }
+]

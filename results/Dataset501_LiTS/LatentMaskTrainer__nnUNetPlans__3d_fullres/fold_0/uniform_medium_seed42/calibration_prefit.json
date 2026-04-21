@@ -1,0 +1,19 @@
+{
+  "version": "v5",
+  "neg_mode": "uniform",
+  "pi_hat": 0.0010977969354550488,
+  "mu": 7.3297496890415115,
+  "s0": 3.3672958299864737,
+  "linear_a": -0.276980136884565,
+  "linear_b": 0.12477307170355724,
+  "rho_min": 0.26608080199416995,
+  "rho_max": 0.6311363636363636,
+  "steepness": "medium",
+  "n_ambiguous": 0,
+  "n_total_ccs": 135,
+  "unmatched_rate": 0.3111111111111111,
+  "ambiguous_rate": 0.0,
+  "n_pairs": 135,
+  "n_annotated": 93,
+  "n_missed": 42
+}

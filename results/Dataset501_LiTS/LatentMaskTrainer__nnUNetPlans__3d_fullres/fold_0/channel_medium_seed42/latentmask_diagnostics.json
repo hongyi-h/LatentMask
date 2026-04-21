@@ -5,14 +5,14 @@
     "neg_mode": "channel",
     "d_margin": 5,
     "fallback_triggered": false,
-    "coverage_ratio_mean": 0.07433604255450466,
-    "nascent_ratio_mean": 0.3236193340972753,
-    "mean_alpha_mean": 0.5138056462799228,
-    "tight_loss_mean": 0.03677020947848511,
-    "fill_loss_mean": 0.05596621707856104,
-    "neg_loss_mean": 0.006833656497987891,
+    "coverage_ratio_mean": 0.07214897705810419,
+    "nascent_ratio_mean": 0.30808823529411766,
+    "mean_alpha_mean": 0.5028041920597066,
+    "tight_loss_mean": 0.04394229060749079,
+    "fill_loss_mean": 0.05496159562850832,
+    "neg_loss_mean": 0.005529293712136089,
     "n_box_steps": 68,
     "total_boxes": 177,
-    "n_ccs_total": 846
+    "n_ccs_total": 503
   }
 ]

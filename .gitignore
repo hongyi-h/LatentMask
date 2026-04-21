@@ -2,9 +2,10 @@
 __pycache__/
 
 /data/
+/data_preprocessed/
 _backup/
 
-/results/
+# /results/
 /refine-logs/
 
 FINAL_PROPOSAL_zh.md
@@ -12,3 +13,6 @@ FINAL_PROPOSAL.md
 NOVELTY_CHECK_REPORT*.md
 
 notes/
+
+*.pth
+*.egg-info

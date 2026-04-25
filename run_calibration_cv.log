@@ -1,0 +1,90 @@
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# python -m latentmask.scripts.run_calibration_cv \
+  --dataset_dir data_preprocessed/Dataset501_LiTS \
+  --box_annotations_dir data/box_annotations/P-steep \
+  --protocol P-steep \
+  --fold 0 --pixel_fraction 0.3 \
+  --output results/m1_calibration_v6/
+=== M1 Calibration (v6.1 offline boxes) ===
+  Protocol: P-steep
+  Pixel scans: 31
+  Box annotations: data/box_annotations/P-steep
+  Total CCs: 136
+  Median log-size: 7.39
+
+Fitting g_theta (full dataset, offline boxes)...
+
+  Isotonic ECE: 0.0065
+  Linear ECE:   0.1869
+  Linear: alpha = -0.3050 + 0.1334 * log_size
+  Unmatched rate: 0.301
+  Ambiguous rate: 0.000
+
+Running 3-fold CV...
+  CV ECE: 0.0322 +/- 0.0100
+    Fold 0: ECE = 0.0220
+    Fold 1: ECE = 0.0290
+    Fold 2: ECE = 0.0457
+
+  Gate (max fold ECE < 0.10): PASS (max = 0.0457)
+
+Results saved to results/m1_calibration_v6/calibration_P-steep_v6.json
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# python -m latentmask.scripts.run_calibration_cv \
+  --dataset_dir data_preprocessed/Dataset501_LiTS \
+  --box_annotations_dir data/box_annotations/P-mild \
+  --protocol P-mild \
+  --fold 0 --pixel_fraction 0.3 \
+  --output results/m1_calibration_v6/
+=== M1 Calibration (v6.1 offline boxes) ===
+  Protocol: P-mild
+  Pixel scans: 31
+  Box annotations: data/box_annotations/P-mild
+  Total CCs: 136
+  Median log-size: 7.39
+
+Fitting g_theta (full dataset, offline boxes)...
+
+  Isotonic ECE: 0.0010
+  Linear ECE:   0.0566
+  Linear: alpha = 0.3137 + 0.0570 * log_size
+  Unmatched rate: 0.257
+  Ambiguous rate: 0.000
+
+Running 3-fold CV...
+  CV ECE: 0.0831 +/- 0.0454
+    Fold 0: ECE = 0.0658
+    Fold 1: ECE = 0.1453
+    Fold 2: ECE = 0.0384
+
+  Gate (max fold ECE < 0.10): FAIL (max = 0.1453)
+
+Results saved to results/m1_calibration_v6/calibration_P-mild_v6.json
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# python -m latentmask.scripts.run_calibration_cv \
+  --dataset_dir data_preprocessed/Dataset501_LiTS \
+  --box_annotations_dir data/box_annotations/P-uniform \
+  --protocol P-uniform \
+  --fold 0 --pixel_fraction 0.3 \
+  --output results/m1_calibration_v6/
+=== M1 Calibration (v6.1 offline boxes) ===
+  Protocol: P-uniform
+  Pixel scans: 31
+  Box annotations: data/box_annotations/P-uniform
+  Total CCs: 136
+  Median log-size: 7.39
+
+Fitting g_theta (full dataset, offline boxes)...
+
+  Isotonic ECE: 0.0000
+  Linear ECE:   0.0181
+  Linear: alpha = 0.5906 + 0.0114 * log_size
+  Unmatched rate: 0.324
+  Ambiguous rate: 0.000
+
+Running 3-fold CV...
+  CV ECE: 0.1373 +/- 0.0336
+    Fold 0: ECE = 0.1834
+    Fold 1: ECE = 0.1245
+    Fold 2: ECE = 0.1041
+
+  Gate (max fold ECE < 0.10): FAIL (max = 0.1834)
+
+Results saved to results/m1_calibration_v6/calibration_P-uniform_v6.json

@@ -1,0 +1,39 @@
+{
+  "version": "v6.1",
+  "timestamp": "2026-04-26 00:56:24",
+  "protocol": "P-uniform",
+  "n_pixel_scans": 31,
+  "n_total_ccs": 136,
+  "mu": 7.394774653802797,
+  "full_fit": {
+    "s0": 2.772588722239781,
+    "linear_a": 0.5905779071060665,
+    "linear_b": 0.011416948992080277,
+    "ece_isotonic": 0.0,
+    "ece_linear": 0.01809641904147212,
+    "n_ambiguous": 0,
+    "n_total_ccs": 136,
+    "unmatched_rate": 0.32352941176470584,
+    "ambiguous_rate": 0.0,
+    "n_pairs": 136,
+    "n_annotated": 92,
+    "n_missed": 44
+  },
+  "cross_validation": {
+    "per_fold_ece": [
+      0.1833896377374638,
+      0.124505928853755,
+      0.1041462300162346
+    ],
+    "mean_ece": 0.1373472655358178,
+    "std_ece": 0.033601134530992754,
+    "pairing_stats": {
+      "n_ambiguous": 0,
+      "n_total_ccs": 136,
+      "unmatched_rate": 0.32352941176470584,
+      "ambiguous_rate": 0.0,
+      "n_pairs": 136
+    }
+  },
+  "gate_pass": false
+}

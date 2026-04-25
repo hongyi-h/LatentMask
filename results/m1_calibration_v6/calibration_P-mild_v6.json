@@ -1,0 +1,39 @@
+{
+  "version": "v6.1",
+  "timestamp": "2026-04-26 00:46:57",
+  "protocol": "P-mild",
+  "n_pixel_scans": 31,
+  "n_total_ccs": 136,
+  "mu": 7.394774653802797,
+  "full_fit": {
+    "s0": 2.772588722239781,
+    "linear_a": 0.3137115352408108,
+    "linear_b": 0.057014578299951955,
+    "ece_isotonic": 0.0010294117647059126,
+    "ece_linear": 0.05660586050755662,
+    "n_ambiguous": 0,
+    "n_total_ccs": 136,
+    "unmatched_rate": 0.25735294117647056,
+    "ambiguous_rate": 0.0,
+    "n_pairs": 136,
+    "n_annotated": 101,
+    "n_missed": 35
+  },
+  "cross_validation": {
+    "per_fold_ece": [
+      0.06577888702821476,
+      0.1453019524004625,
+      0.03836253707727797
+    ],
+    "mean_ece": 0.08314779216865174,
+    "std_ece": 0.04535246253328304,
+    "pairing_stats": {
+      "n_ambiguous": 0,
+      "n_total_ccs": 136,
+      "unmatched_rate": 0.25735294117647056,
+      "ambiguous_rate": 0.0,
+      "n_pairs": 136
+    }
+  },
+  "gate_pass": false
+}

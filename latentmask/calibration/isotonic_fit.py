@@ -281,8 +281,14 @@ def generate_annotation_pairs(seg_list, fg_label=2, min_cc_size=10,
         stats['n_total_ccs'] += len(ccs)
         all_bboxes = [cc['bbox'] for cc in ccs]
 
-        # Simulate annotation (drop small CCs)
-        if drop_fn is not None:
+        # Get annotation boxes: offline (v6) or simulated (v5)
+        if offline_boxes_per_scan is not None:
+            scan_boxes = offline_boxes_per_scan[scan_idx]
+            annotation_boxes = [
+                tuple(tuple(pair) for pair in b['bbox'])
+                for b in scan_boxes
+            ]
+        elif drop_fn is not None:
             log_sizes_arr = np.array([cc['log_size'] for cc in ccs])
             keep_probs = drop_fn(log_sizes_arr)
             keep_flags = rng.random(len(ccs)) < keep_probs
@@ -334,18 +340,16 @@ def generate_annotation_pairs(seg_list, fg_label=2, min_cc_size=10,
 
 
 def fit_g_theta_hungarian(seg_list, fg_label=2, min_cc_size=10,
-                           iou_threshold=0.3, drop_fn=None, rng=None):
-    """v5 full protocol: generate pairs + fit isotonic + fit linear.
+                           iou_threshold=0.3, drop_fn=None, rng=None,
+                           offline_boxes_per_scan=None):
+    """Full protocol: generate pairs + fit isotonic + fit linear.
 
     Returns:
-        ir: fitted IsotonicRegression
-        s0: minimum support
-        linear_a: linear intercept
-        linear_b: linear slope
-        stats: dict with fitting statistics
+        ir, s0, linear_a, linear_b, stats
     """
     log_sizes, annotations, scan_indices, stats = generate_annotation_pairs(
-        seg_list, fg_label, min_cc_size, iou_threshold, drop_fn, rng)
+        seg_list, fg_label, min_cc_size, iou_threshold, drop_fn, rng,
+        offline_boxes_per_scan=offline_boxes_per_scan)
 
     if len(log_sizes) == 0:
         raise ValueError("No CCs found in any scan — cannot fit g_theta")
@@ -371,17 +375,15 @@ def fit_g_theta_hungarian(seg_list, fg_label=2, min_cc_size=10,
 
 def cross_validate_g_theta_hungarian(seg_list, fg_label=2, n_folds=3,
                                       min_cc_size=10, iou_threshold=0.3,
-                                      drop_fn=None, rng=None):
-    """3-fold CV of g_theta fitting with scan-level splits.
-
-    Returns dict with per_fold_ece, mean_ece, std_ece.
-    """
+                                      drop_fn=None, rng=None,
+                                      offline_boxes_per_scan=None):
+    """3-fold CV of g_theta fitting with scan-level splits."""
     if rng is None:
         rng = np.random.default_rng(42)
 
-    # Generate ALL pairs once (consistent simulation)
     log_sizes, annotations, scan_indices, stats = generate_annotation_pairs(
-        seg_list, fg_label, min_cc_size, iou_threshold, drop_fn, rng)
+        seg_list, fg_label, min_cc_size, iou_threshold, drop_fn, rng,
+        offline_boxes_per_scan=offline_boxes_per_scan)
 
     if len(log_sizes) == 0:
         return {'per_fold_ece': [], 'mean_ece': float('inf'), 'std_ece': 0.0}

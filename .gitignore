@@ -8,9 +8,9 @@ _backup/
 # /results/
 /refine-logs/
 
-FINAL_PROPOSAL_zh.md
-FINAL_PROPOSAL.md
-NOVELTY_CHECK_REPORT*.md
+# FINAL_PROPOSAL_zh.md
+# FINAL_PROPOSAL.md
+# NOVELTY_CHECK_REPORT*.md
 
 notes/
 

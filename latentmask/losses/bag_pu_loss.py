@@ -149,7 +149,7 @@ def compute_neg_loss_v5(fg_probs, safe_mask, neg_mode,
 
 # ── Sample-level loss ──────────────────────────────────────────────────
 
-def _compute_sample_loss_v5(fg_probs, boxes, safe_mask,
+def _compute_sample_loss_v6(fg_probs, boxes, safe_mask,
                              neg_mode='channel',
                              g_theta_func=None, s0=0.0,
                              linear_a=0.0, linear_b=0.1,
@@ -159,7 +159,7 @@ def _compute_sample_loss_v5(fg_probs, boxes, safe_mask,
                              beta_fill=1.0, gamma_neg=0.1,
                              tau_low=0.3, tau_high=0.5, alpha_min=0.05,
                              min_cc_size=10, enable_neg=True):
-    """Compute 3-term box loss for one sample (v5)."""
+    """Compute 3-term box loss for one sample (v6: no label leakage)."""
     device = fg_probs.device
     eps = 1e-7
 
@@ -170,19 +170,15 @@ def _compute_sample_loss_v5(fg_probs, boxes, safe_mask,
 
     for box_info in boxes:
         bbox = box_info['bbox']
-        true_size = box_info.get('true_size', None)
 
-        # IPW weight from g_theta
+        # IPW weight from predicted mass only (F4 fix: no true_size)
         if ipw_mode == 'uniform' or neg_mode == 'uniform':
             w = 1.0
         elif g_theta_func is not None:
-            if true_size is not None:
-                log_s = np.log(max(true_size, 1))
-            else:
-                with torch.no_grad():
-                    (z1, z2), (y1, y2), (x1, x2) = bbox
-                    mass = fg_probs[z1:z2, y1:y2, x1:x2].detach().sum()
-                    log_s = float(np.log(max(mass.item(), np.exp(s0))))
+            with torch.no_grad():
+                (z1, z2), (y1, y2), (x1, x2) = bbox
+                mass = fg_probs[z1:z2, y1:y2, x1:x2].detach().sum()
+                log_s = float(np.log(max(mass.item(), np.exp(s0))))
             propensity = g_theta_func(np.array([log_s]))[0]
             w = min(1.0 / max(propensity, eps), w_max)
         else:
@@ -236,9 +232,9 @@ def _compute_sample_loss_v5(fg_probs, boxes, safe_mask,
     return total, diagnostics
 
 
-# ── Batch-level loss ───────────────────────────────────────────────────
+# ── Batch-level loss (v6: no label leakage) ──────────────────────────
 
-def compute_batch_box_loss_v5(output, target, neg_mode='channel',
+def compute_batch_box_loss_v6(output, box_metadata_list, neg_mode='channel',
                                g_theta_func=None, s0=0.0,
                                linear_a=0.0, linear_b=0.1,
                                d_margin=5, w_max=10.0, ipw_mode='channel',
@@ -248,24 +244,25 @@ def compute_batch_box_loss_v5(output, target, neg_mode='channel',
                                beta_fill=1.0, gamma_neg=0.1,
                                tau_low=0.3, tau_high=0.5, alpha_min=0.05,
                                enable_neg=True):
-    """Compute v5 channel-modulated box loss over a batch.
+    """Compute v6 channel-modulated box loss over a batch (leakage-free).
 
     Args:
         output: (B, C, D, H, W) network output logits.
-        target: (B, 1, D, H, W) ground truth segmentation.
-        neg_mode: 'uniform' | 'linear' | 'channel'.
-        All other args: see _compute_sample_loss_v5.
+        box_metadata_list: list of length B. Each element is a list of
+            box dicts: [{'bbox': ((z1,z2),(y1,y2),(x1,x2))}, ...].
+            Empty list means no boxes for that sample.
+        neg_mode: 'uniform' | 'linear' | 'channel' | 'constant' | 'inverted'.
+        All other args: see _compute_sample_loss_v6.
 
     Returns:
         loss: scalar tensor.
         batch_diag: dict with aggregated diagnostics.
     """
-    from latentmask.utils.cc_extraction import (
-        extract_ccs_from_patch, compute_safe_zone_mask,
-    )
+    from latentmask.utils.cc_extraction import compute_safe_zone_from_boxes
 
     B = output.shape[0]
     device = output.device
+    patch_shape = output.shape[2:]  # (D, H, W)
 
     probs = torch.softmax(output.float(), dim=1)
     if fg_label is not None and fg_label < probs.shape[1]:
@@ -278,21 +275,18 @@ def compute_batch_box_loss_v5(output, target, neg_mode='channel',
     n_valid = 0
 
     for b in range(B):
-        seg_np = target[b, 0].cpu().numpy().astype(np.int32)
-
-        # Extract GT CCs -> bounding boxes for scaffold
-        ccs = extract_ccs_from_patch(seg_np, min_size=min_cc_size,
-                                     fg_label=fg_label)
-        if len(ccs) == 0:
+        boxes = box_metadata_list[b]
+        if len(boxes) == 0:
             continue
 
-        boxes = [{'bbox': cc['bbox'], 'true_size': cc['size']} for cc in ccs]
+        bbox_coords = [box['bbox'] for box in boxes]
 
-        # Safe zone from GT foreground
-        safe_np = compute_safe_zone_mask(seg_np, d_margin, fg_label=fg_label)
+        # F3 fix: safe zone from boxes only, not GT foreground
+        safe_np = compute_safe_zone_from_boxes(patch_shape, bbox_coords,
+                                                d_margin)
         safe_mask = torch.from_numpy(safe_np).to(device)
 
-        sample_loss, diag = _compute_sample_loss_v5(
+        sample_loss, diag = _compute_sample_loss_v6(
             fg_probs[b], boxes, safe_mask,
             neg_mode=neg_mode,
             g_theta_func=g_theta_func, s0=s0,

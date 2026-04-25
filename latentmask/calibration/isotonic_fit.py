@@ -241,24 +241,25 @@ def _compute_box_iou(box1, box2):
 
 
 def generate_annotation_pairs(seg_list, fg_label=2, min_cc_size=10,
-                               iou_threshold=0.3, drop_fn=None, rng=None):
+                               iou_threshold=0.3, drop_fn=None, rng=None,
+                               offline_boxes_per_scan=None):
     """Generate (log_size, annotation_status) from pixel-labeled scans.
 
-    v5 protocol (FINAL_PROPOSAL §4.3):
-      1. Extract GT CCs per scan
-      2. Generate bounding boxes from GT
-      3. Simulate annotation miss via drop_fn (size-dependent)
-      4. Hungarian matching: GT CCs <-> kept boxes via IoU
-      5. Matched (IoU > threshold) -> annotated (1), else missed (0)
+    Two modes:
+      - Online (v5): drop_fn simulates which boxes are retained.
+      - Offline (v6): offline_boxes_per_scan provides pre-generated boxes.
 
     Args:
         seg_list: list of 3D numpy arrays (GT segmentations)
         fg_label: foreground label for CC extraction
-        drop_fn: callable(log_sizes) -> keep_probabilities. If None, all kept.
+        drop_fn: callable(log_sizes) -> keep_probabilities (v5 mode)
         rng: numpy random generator
+        offline_boxes_per_scan: list of lists of box dicts, one per scan.
+            Each box dict has 'bbox': [[z1,z2],[y1,y2],[x1,x2]].
+            If provided, drop_fn is ignored.
 
     Returns:
-        log_sizes, annotations, scan_indices (all numpy arrays)
+        log_sizes, annotations, scan_indices (all numpy arrays), stats dict
     """
     from scipy.optimize import linear_sum_assignment
     from latentmask.utils.cc_extraction import extract_connected_components

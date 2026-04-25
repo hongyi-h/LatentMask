@@ -42,12 +42,24 @@ def compute_retention_scale(steepness, mu, cc_sizes, target_R):
 
 
 def load_seg(gt_dir, key):
-    """Load GT segmentation from gt_segmentations/."""
-    path = os.path.join(gt_dir, f'{key}.npy')
-    seg = np.load(path)
-    if seg.ndim == 4:
-        seg = seg[0]
-    return seg
+    """Load GT segmentation from gt_segmentations/ (.npy or .nii.gz)."""
+    npy_path = os.path.join(gt_dir, f'{key}.npy')
+    if os.path.exists(npy_path):
+        seg = np.load(npy_path)
+        if seg.ndim == 4:
+            seg = seg[0]
+        return seg
+
+    nii_path = os.path.join(gt_dir, f'{key}.nii.gz')
+    if os.path.exists(nii_path):
+        import nibabel as nib
+        seg = nib.load(nii_path).get_fdata(dtype=np.float32)
+        return seg.astype(np.int32)
+
+    raise FileNotFoundError(
+        f'No segmentation found for {key} in {gt_dir} '
+        f'(tried .npy and .nii.gz)'
+    )
 
 
 def generate_boxes_for_scan(seg, protocol, mu, scale_factor, target_R,

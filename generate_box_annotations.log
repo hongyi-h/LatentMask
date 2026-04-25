@@ -1,0 +1,62 @@
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# python -m latentmask.scripts.generate_box_annotations   --dataset_dir /mnt/afs/zhengmingkai/hhy/LatentMask/data_preprocessed/Dataset501_LiTS   --output_dir /mnt/afs/zhengmingkai/hhy/LatentMask/data/box_annotations   --fold 0   --pixel_fraction 0.3   --target_R 0.70   --fg_label 2   --seed 42
+Fold 0: 104 train (31 pixel, 73 box), 27 val
+Generating boxes for all 131 scans
+Target retention rate: 0.7
+Median log-CC-size (mu): 7.39, total CCs: 136
+  P-uniform: constant keep_prob = 0.70
+  P-mild: scale_factor = 0.9342
+  P-steep: scale_factor = 3.0506
+  P-uniform: 131 scans, actual R = 0.697 (target 0.70)
+  P-mild: 131 scans, actual R = 0.669 (target 0.70)
+  P-steep: 131 scans, actual R = 0.640 (target 0.70)
+Done.
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# ls data/box_annotations/
+P-mild  P-steep  P-uniform  _split_meta.json
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# cat data/box_annotations/P-steep/$(ls data/box_annotations/P-steep/ | head -1)
+{
+  "protocol": "P-steep",
+  "target_R": 0.7,
+  "actual_R": 0.6402714932126696,
+  "mu": 7.394774653802797,
+  "scale_factor": 3.0506269836425783,
+  "seed": 42,
+  "n_scans": 131,
+  "total_ccs": 884,
+  "total_retained": 566
+}
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# cat data/box_annotations/P-uniform/_summary.json
+{
+  "protocol": "P-uniform",
+  "target_R": 0.7,
+  "actual_R": 0.6968325791855203,
+  "mu": 7.394774653802797,
+  "scale_factor": null,
+  "seed": 42,
+  "n_scans": 131,
+  "total_ccs": 884,
+  "total_retained": 616
+}
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# cat data/box_annotations/P-mild/_summary.json
+{
+  "protocol": "P-mild",
+  "target_R": 0.7,
+  "actual_R": 0.668552036199095,
+  "mu": 7.394774653802797,
+  "scale_factor": 0.9341580772399902,
+  "seed": 42,
+  "n_scans": 131,
+  "total_ccs": 884,
+  "total_retained": 591
+}
+(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# cat data/box_annotations/P-steep/_summary.json
+{
+  "protocol": "P-steep",
+  "target_R": 0.7,
+  "actual_R": 0.6402714932126696,
+  "mu": 7.394774653802797,
+  "scale_factor": 3.0506269836425783,
+  "seed": 42,
+  "n_scans": 131,
+  "total_ccs": 884,
+  "total_retained": 566
+}

@@ -166,9 +166,14 @@ def main():
 
     rng = np.random.default_rng(args.seed)
 
-    # Collect all CC sizes from pixel-labeled scans for mu and scale
+    # Collect CC sizes from ALL scans for protocol-level retention-rate matching.
+    # Rationale: the scale factor defines the PROTOCOL (benchmark drop rule),
+    # not the METHOD. Using only pixel scans (31/131) gives a biased size
+    # distribution, causing actual R to drift from target (observed: P-steep
+    # 0.640 vs target 0.70). The method's g_θ is still estimated only from
+    # pixel scans — that boundary is unchanged.
     all_cc_sizes = []
-    for key in pixel_keys:
+    for key in all_keys:
         seg = load_seg(gt_dir, key)
         ccs = extract_connected_components(seg, min_size=args.min_cc_size,
                                            fg_label=args.fg_label)
@@ -176,7 +181,7 @@ def main():
             all_cc_sizes.append(cc['size'])
 
     if len(all_cc_sizes) == 0:
-        print("ERROR: no CCs found in pixel-labeled scans. Check fg_label.")
+        print("ERROR: no CCs found. Check fg_label.")
         sys.exit(1)
 
     all_cc_sizes = np.array(all_cc_sizes)

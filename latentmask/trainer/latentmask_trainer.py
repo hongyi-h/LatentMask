@@ -113,9 +113,8 @@ class LatentMaskTrainer(nnUNetTrainer):
         self._epoch_box_diags = []
         self._fallback_triggered = False
 
-        # v6: box annotations loaded from offline-generated JSON
+        # v6: box annotations dir for BoxSegDatasetWrapper
         self.box_annotations_dir = os.environ.get('LM_BOX_ANNOTATIONS_DIR', '')
-        self.box_annotations = {}  # {scan_id: [{'bbox': ...}, ...]}
 
         if self.neg_mode == 'none':
             self.warmup_epochs = self.num_epochs
@@ -202,13 +201,26 @@ class LatentMaskTrainer(nnUNetTrainer):
             probabilistic_oversampling=self.probabilistic_oversampling,
         )
 
-        # Box DataLoader
+        # Box DataLoader (v6: loads box_seg instead of GT seg)
         if len(self.box_keys) > 0:
-            box_dataset = self.dataset_class(
+            box_dataset_raw = self.dataset_class(
                 self.preprocessed_dataset_folder, self.box_keys,
                 folder_with_segs_from_previous_stage=
                 self.folder_with_segs_from_previous_stage,
             )
+            if self.box_annotations_dir:
+                from latentmask.data.box_seg_dataset import BoxSegDatasetWrapper
+                box_seg_dir = os.path.join(self.box_annotations_dir,
+                                           'box_segmentations')
+                box_dataset = BoxSegDatasetWrapper(box_dataset_raw, box_seg_dir)
+                self.print_to_log_file(
+                    f"  Box dataloader: using box_seg from {box_seg_dir}")
+            else:
+                box_dataset = box_dataset_raw
+                self.print_to_log_file(
+                    "  WARNING: LM_BOX_ANNOTATIONS_DIR not set, "
+                    "box dataloader uses GT seg (leakage!)")
+
             dl_box_raw = nnUNetDataLoader(
                 box_dataset, self.batch_size, initial_patch_size,
                 self.configuration_manager.patch_size, self.label_manager,
@@ -260,38 +272,7 @@ class LatentMaskTrainer(nnUNetTrainer):
 
     def on_train_start(self):
         super().on_train_start()
-        self._load_box_annotations()
         self._prefit_calibration_v5()
-
-    def _load_box_annotations(self):
-        """Load pre-generated box annotations from JSON files (v6)."""
-        if self.neg_mode == 'none' or not self.box_annotations_dir:
-            return
-
-        if not os.path.isdir(self.box_annotations_dir):
-            self.print_to_log_file(
-                f"WARNING: box_annotations_dir not found: "
-                f"{self.box_annotations_dir}")
-            return
-
-        loaded = 0
-        for key in self.box_keys:
-            json_path = os.path.join(self.box_annotations_dir, f'{key}.json')
-            if os.path.exists(json_path):
-                with open(json_path) as f:
-                    data = json.load(f)
-                boxes = []
-                for b in data.get('boxes', []):
-                    bbox = tuple(tuple(pair) for pair in b['bbox'])
-                    boxes.append({'bbox': bbox})
-                self.box_annotations[key] = boxes
-                loaded += 1
-
-        # Also load for pixel keys (they may have box annotations for
-        # calibration, but we don't use them during training)
-        self.print_to_log_file(
-            f"  Loaded box annotations for {loaded}/{len(self.box_keys)} "
-            f"box scans from {self.box_annotations_dir}")
 
     def _prefit_calibration_v5(self):
         """Pre-fit g_theta via Hungarian matching on pixel-labeled scans."""
@@ -465,23 +446,36 @@ class LatentMaskTrainer(nnUNetTrainer):
     def _box_train_step(self, batch):
         """Training step for box-supervised data (v6: no label leakage).
 
-        Box annotations come from pre-generated offline metadata,
-        NOT from the target segmentation mask.
+        The box dataloader loads box_seg (rectangular box regions) instead of
+        GT seg. box_seg goes through the same crop + augment pipeline as data.
+        We extract box bounding boxes from the augmented box_seg via find_objects.
         """
         data = batch['data']
-        keys = batch.get('keys', batch.get('case_properties', [{}]))
+        target = batch['target']
 
         data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            box_seg_batch = target[0].cpu().numpy()
+        else:
+            box_seg_batch = target.cpu().numpy()
 
-        # Look up pre-generated box annotations by scan key
+        # Extract boxes from augmented box_seg for each sample
         B = data.shape[0]
         box_metadata_list = []
         for b in range(B):
-            key = keys[b] if isinstance(keys, list) else None
-            if key is not None and key in self.box_annotations:
-                box_metadata_list.append(self.box_annotations[key])
-            else:
-                box_metadata_list.append([])
+            box_seg_np = box_seg_batch[b, 0].astype(np.int32)
+            unique_ids = np.unique(box_seg_np)
+            unique_ids = unique_ids[unique_ids > 0]
+
+            boxes = []
+            if len(unique_ids) > 0:
+                from scipy.ndimage import find_objects
+                slices = find_objects(box_seg_np)
+                for s in slices:
+                    if s is not None:
+                        bbox = tuple((sl.start, sl.stop) for sl in s)
+                        boxes.append({'bbox': bbox})
+            box_metadata_list.append(boxes)
 
         self.optimizer.zero_grad(set_to_none=True)
 

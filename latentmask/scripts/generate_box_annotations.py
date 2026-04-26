@@ -64,14 +64,20 @@ def load_seg(gt_dir, key):
 
 def generate_boxes_for_scan(seg, protocol, mu, scale_factor, target_R,
                             min_cc_size=10, fg_label=2, rng=None):
-    """Generate box annotations for one scan under a given protocol."""
+    """Generate box annotations and box_seg volume for one scan.
+
+    Returns dict with 'boxes', 'box_seg', and stats.
+    box_seg: same shape as seg, each retained box's bounding box region
+    filled with a unique integer ID (1, 2, ...). Background = 0.
+    """
     if rng is None:
         rng = np.random.default_rng()
 
     ccs = extract_connected_components(seg, min_size=min_cc_size,
                                        fg_label=fg_label)
     if len(ccs) == 0:
-        return {'boxes': [], 'n_total': 0, 'n_retained': 0, 'n_dropped': 0}
+        return {'boxes': [], 'box_seg': np.zeros_like(seg, dtype=np.int16),
+                'n_total': 0, 'n_retained': 0, 'n_dropped': 0}
 
     log_sizes = np.array([cc['log_size'] for cc in ccs])
 
@@ -87,12 +93,19 @@ def generate_boxes_for_scan(seg, protocol, mu, scale_factor, target_R,
     keep_flags = draws < keep_probs
 
     boxes = []
+    box_seg = np.zeros(seg.shape, dtype=np.int16)
+    box_id = 1
     for i, cc in enumerate(ccs):
         if keep_flags[i]:
-            boxes.append({'bbox': [list(pair) for pair in cc['bbox']]})
+            bbox = cc['bbox']
+            boxes.append({'bbox': [list(pair) for pair in bbox]})
+            (z1, z2), (y1, y2), (x1, x2) = bbox
+            box_seg[z1:z2, y1:y2, x1:x2] = box_id
+            box_id += 1
 
     return {
         'boxes': boxes,
+        'box_seg': box_seg,
         'n_total': len(ccs),
         'n_retained': int(keep_flags.sum()),
         'n_dropped': int((~keep_flags).sum()),
@@ -201,10 +214,12 @@ def main():
         else:
             print(f"  {name}: constant keep_prob = {args.target_R:.2f}")
 
-    # Generate box annotations
+    # Generate box annotations and box_seg volumes
     for protocol_name, scale_factor in protocols.items():
         protocol_dir = os.path.join(args.output_dir, protocol_name)
+        box_seg_dir = os.path.join(protocol_dir, 'box_segmentations')
         os.makedirs(protocol_dir, exist_ok=True)
+        os.makedirs(box_seg_dir, exist_ok=True)
 
         stats = {'n_scans': 0, 'total_ccs': 0, 'total_retained': 0}
 
@@ -217,6 +232,12 @@ def main():
                 rng=rng,
             )
 
+            # Save box_seg volume (same shape as GT seg, int16)
+            box_seg = result.pop('box_seg')
+            np.save(os.path.join(box_seg_dir, f'{key}.npy'),
+                    box_seg[np.newaxis].astype(np.int16))
+
+            # Save JSON metadata (without box_seg)
             output = {
                 'scan_id': key,
                 'protocol': protocol_name,
@@ -224,7 +245,6 @@ def main():
                 'mu': mu,
                 **result,
             }
-
             with open(os.path.join(protocol_dir, f'{key}.json'), 'w') as f:
                 json.dump(output, f, indent=2)
 

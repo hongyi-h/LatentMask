@@ -1,11 +1,8 @@
-(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# python -m latentmask.scripts.generate_box_annotations \
-  --dataset_dir /mnt/afs/zhengmingkai/hhy/LatentMask/data_preprocessed/Dataset501_LiTS \
-  --output_dir /mnt/afs/zhengmingkai/hhy/LatentMask/data/box_annotations \
-  --fold 0 \
-  --pixel_fraction 0.3 \
-  --target_R 0.70 \
-  --fg_label 2 \
-  --seed 42
+(latentmask) root@pt-caf0af288db34325b56284b19fe88d7f-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# python -m latentmask.scripts.generate_box_annotations \
+  --dataset_dir data_preprocessed/Dataset501_LiTS \
+  --output_dir data/box_annotations \
+  --fold 0 --pixel_fraction 0.3 \
+  --target_R 0.70 --fg_label 2 --seed 42
 Fold 0: 104 train (31 pixel, 73 box), 27 val
 Generating boxes for all 131 scans
 Target retention rate: 0.7
@@ -17,37 +14,25 @@ Median log-CC-size (mu): 6.82, total CCs: 884
   P-mild: 131 scans, actual R = 0.700 (target 0.70)
   P-steep: 131 scans, actual R = 0.700 (target 0.70)
 Done.
-(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# cat data/box_annotations/P-uniform/_summary.json
-{
-  "protocol": "P-uniform",
-  "target_R": 0.7,
-  "actual_R": 0.6968325791855203,
-  "mu": 6.81618793533465,
-  "scale_factor": null,
-  "seed": 42,
-  "n_scans": 131,
-  "total_ccs": 884,
-  "total_retained": 616
-}(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# cat data/box_annotations/P-mild/_summary.json
-{
-  "protocol": "P-mild",
-  "target_R": 0.7,
-  "actual_R": 0.7002262443438914,
-  "mu": 6.81618793533465,
-  "scale_factor": 0.9264743852615357,
-  "seed": 42,
-  "n_scans": 131,
-  "total_ccs": 884,
-  "total_retained": 619
-}(latentmask) root@pt-09152c2a4d654b7ca5bd34af6e5cb8b3-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# cat data/box_annotations/P-steep/_summary.json
-{
-  "protocol": "P-steep",
-  "target_R": 0.7,
-  "actual_R": 0.7002262443438914,
-  "mu": 6.81618793533465,
-  "scale_factor": 2.796669769287109,
-  "seed": 42,
-  "n_scans": 131,
-  "total_ccs": 884,
-  "total_retained": 619
-}
+(latentmask) root@pt-caf0af288db34325b56284b19fe88d7f-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# ls data/box_annotations/P-steep/box_segmentations/ | head -5
+ls: cannot access 'data/box_annotations/P-steep/box_segmentations/': No such file or directory
+(latentmask) root@pt-caf0af288db34325b56284b19fe88d7f-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# ls data/box_annotations/P-steep/ | head -5
+_summary.json
+case_00000.json
+case_00001.json
+case_00002.json
+case_00003.json
+(latentmask) root@pt-caf0af288db34325b56284b19fe88d7f-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# python3 -c "
+import numpy as np, os
+f = sorted(os.listdir('data/box_annotations/P-steep/'))[0]
+seg = np.load(f'data/box_annotations/P-steep/{f}')
+print(f'File: {f}, shape: {seg.shape}, dtype: {seg.dtype}')
+print(f'Unique IDs: {np.unique(seg)}')
+print(f'Non-zero voxels: {(seg > 0).sum()}')
+"
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+  File "/mnt/afs/zhengmingkai/miniconda3/envs/latentmask/lib/python3.12/site-packages/numpy/lib/npyio.py", line 462, in load
+    raise ValueError("Cannot load file containing pickled data "
+ValueError: Cannot load file containing pickled data when allow_pickle=False
+

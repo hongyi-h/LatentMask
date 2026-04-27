@@ -71,7 +71,7 @@ class LatentMaskTrainer(nnUNetTrainer):
                  device=torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
 
-        self.num_epochs = 300
+        self.num_epochs = int(os.environ.get('LM_NUM_EPOCHS', 300))
 
         # Read config from environment
         self.neg_mode = os.environ.get('LM_NEG_MODE', self.NEG_MODE)

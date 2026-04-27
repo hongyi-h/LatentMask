@@ -15,24 +15,34 @@ Median log-CC-size (mu): 6.82, total CCs: 884
   P-steep: 131 scans, actual R = 0.700 (target 0.70)
 Done.
 (latentmask) root@pt-caf0af288db34325b56284b19fe88d7f-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# ls data/box_annotations/P-steep/box_segmentations/ | head -5
-ls: cannot access 'data/box_annotations/P-steep/box_segmentations/': No such file or directory
-(latentmask) root@pt-caf0af288db34325b56284b19fe88d7f-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# ls data/box_annotations/P-steep/ | head -5
-_summary.json
-case_00000.json
-case_00001.json
-case_00002.json
-case_00003.json
+case_00000.npy
+case_00001.npy
+case_00002.npy
+case_00003.npy
+case_00004.npy
 (latentmask) root@pt-caf0af288db34325b56284b19fe88d7f-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# python3 -c "
 import numpy as np, os
-f = sorted(os.listdir('data/box_annotations/P-steep/'))[0]
-seg = np.load(f'data/box_annotations/P-steep/{f}')
+f = sorted(os.listdir('data/box_annotations/P-steep/box_segmentations/'))[0]
+seg = np.load(f'data/box_annotations/P-steep/box_segmentations/{f}')
 print(f'File: {f}, shape: {seg.shape}, dtype: {seg.dtype}')
 print(f'Unique IDs: {np.unique(seg)}')
 print(f'Non-zero voxels: {(seg > 0).sum()}')
 "
-Traceback (most recent call last):
-  File "<string>", line 4, in <module>
-  File "/mnt/afs/zhengmingkai/miniconda3/envs/latentmask/lib/python3.12/site-packages/numpy/lib/npyio.py", line 462, in load
-    raise ValueError("Cannot load file containing pickled data "
-ValueError: Cannot load file containing pickled data when allow_pickle=False
+File: case_00000.npy, shape: (1, 512, 512, 75), dtype: int16
+Unique IDs: [0 1 2]
+Non-zero voxels: 2448
+(latentmask) root@pt-caf0af288db34325b56284b19fe88d7f-worker-0:/mnt/afs/zhengmingkai/hhy/LatentMask# export LM_BOX_ANNOTATIONS_DIR=data/box_annotations/P-steep
+export LM_NEG_MODE=channel
+export LM_STEEPNESS=steep
 
+nnUNetv2_train 501 3d_fullres 0 \
+  -tr LatentMaskTrainer \
+  --npz \
+  -num_epochs 5 \
+  2>&1 | tail -50
+usage: nnUNetv2_train [-h] [-tr TR] [-p P]
+                      [-pretrained_weights PRETRAINED_WEIGHTS]
+                      [-num_gpus NUM_GPUS] [--npz] [--c] [--val] [--val_best]
+                      [--disable_checkpointing] [-device DEVICE]
+                      dataset_name_or_id configuration fold
+nnUNetv2_train: error: unrecognized arguments: -num_epochs 5

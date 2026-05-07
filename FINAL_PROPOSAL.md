@@ -114,7 +114,7 @@ Setting α(u) = g_θ(log m(C(u))) retains only the false-alarm suppression term,
 S = {u : d_chebyshev(u, ∪_j B_j) > d_safe}, d_safe = 5 voxels (default).
 Boxes come from pre-generated offline metadata. Safe zone never accesses GT segmentation masks.
 
-**Step 2: Two-threshold CC extraction (every K_cc = 50 steps, detached).**
+**Step 2: Two-threshold CC extraction (every box step, detached).**
 1. M_low = 𝟙[f_θ > τ_low] ∩ S, where τ_low = 0.3
 2. 3D connected components: {C_1, ..., C_n} (scipy.ndimage.label, CPU, <10ms/patch)
 3. Per C_k: V_high = {u ∈ C_k : f_θ(u) > τ_high}, where τ_high = 0.5
@@ -150,12 +150,12 @@ L_total = λ_pix · (Dice + CE) + λ_box · L_box
 
 | Stage | Epochs | Data | Notes |
 |---|---|---|---|
-| Pre-fit | 0 | Calibration subset | g_θ (isotonic), ρ_min, ρ_max. Frozen. |
+| Pre-fit | — | Calibration subset (offline CPU, via `run_calibration_cv.py`) | g_θ (isotonic), linear {a,b}, ρ_min, ρ_max, μ, s0 → pickled artifact. Trainer LOADS this (does not re-fit). |
 | Warm-up | 1–50 | Pixel only | Dice+CE. |
 | Ramp | 51–100 | Pixel + Box | L_scaffold. L_channel_neg from epoch 60. |
-| Full | 101–300 | Pixel + Box | All terms. CC every 50 steps. |
+| Full | 101–300 | Pixel + Box | All terms. CC extraction every box step (detached). |
 
-Batch cycle: [pixel, pixel, box]. No EMA. No recalibration. No pseudo-labels.
+Batch cycle: [pixel, pixel, box]. No EMA. No recalibration. No pseudo-labels. **No access to the protocol's functional form inside the trainer** (calibration is supplied as a frozen pickle; protocol is unknown to the method).
 
 ### 5.8 Inference
 
@@ -253,14 +253,14 @@ Reporting: HD95, volume-stratified Dice and detection rate.
 | M0: Fix leakage + offline pipeline (LiTS + BraTS-METS) | 1.5 weeks | 0 |
 | M1: Calibration (both datasets) | 0.5 week | 0 |
 | M2: Baselines — LiTS (C0, C1, C2 × 5 folds) | 3 weeks | ~1,125 |
-| M3: Main — LiTS (C3, C4 × 5 folds + C2.5, C4-inv) | 3 weeks | ~900 |
+| M3: Main — LiTS (C3, C4 × 5 folds + C2.5, C4-inv × 2 folds) | 3 weeks | ~1,050 |
 | M3b/c: Multi-protocol + transfer — LiTS | 2 weeks | ~675 |
 | M3d: Confirmatory — BraTS-METS (C2, C4, C2.5 × 1 split) | 0.5 week | ~225 |
 | M5: Sensitivity — LiTS | 1 week | ~450 |
 | M6: Polish + writing | 1 week | ~50 |
-| **Total** | **~13 weeks** | **~3,425** |
+| **Total** | **~13 weeks** | **~3,550** |
 
-**Budget note**: BraTS-METS confirmatory runs (~225h) offset by removing one LiTS sensitivity sweep if needed. Total stays within ~3,400h envelope.
+**Budget note**: BraTS-METS confirmatory runs (~225h) and the second fold of C2.5/C4-inv (~150h) raise the total to ~3,550h. If over budget, first drop two B4 sensitivity sweeps (~150h); next drop B1c transfer (~75h). C2.5/C4-inv × 2 folds is load-bearing (directly gates "paper dies") and should not be cut.
 
 ## 8. Red Lines
 

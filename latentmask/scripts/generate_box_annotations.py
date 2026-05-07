@@ -179,14 +179,15 @@ def main():
 
     rng = np.random.default_rng(args.seed)
 
-    # Collect CC sizes from ALL scans for protocol-level retention-rate matching.
-    # Rationale: the scale factor defines the PROTOCOL (benchmark drop rule),
-    # not the METHOD. Using only pixel scans (31/131) gives a biased size
-    # distribution, causing actual R to drift from target (observed: P-steep
-    # 0.640 vs target 0.70). The method's g_θ is still estimated only from
-    # pixel scans — that boundary is unchanged.
+    # Collect CC sizes from the TRAIN fold only for protocol-level
+    # retention-rate matching. Using val keys (as an earlier revision did)
+    # would leak val size statistics into the benchmark's drop rule. The
+    # scale factor defines the PROTOCOL (benchmark drop rule), not the
+    # METHOD, so using all train scans (pixel + box) is fine — it just
+    # must not peek at val.
+    scale_keys = train_keys
     all_cc_sizes = []
-    for key in all_keys:
+    for key in scale_keys:
         seg = load_seg(gt_dir, key)
         ccs = extract_connected_components(seg, min_size=args.min_cc_size,
                                            fg_label=args.fg_label)
@@ -199,7 +200,8 @@ def main():
 
     all_cc_sizes = np.array(all_cc_sizes)
     mu = float(np.median(np.log(np.maximum(all_cc_sizes, 1))))
-    print(f"Median log-CC-size (mu): {mu:.2f}, total CCs: {len(all_cc_sizes)}")
+    print(f"Median log-CC-size (mu): {mu:.2f}, "
+          f"total CCs (train-only): {len(all_cc_sizes)}")
 
     # Compute scale factors
     protocols = {

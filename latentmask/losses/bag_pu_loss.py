@@ -44,17 +44,20 @@ def _fill_loss(fg_probs, bbox, rho_min, rho_max, alpha_upper=1.0):
 def compute_neg_loss_v5(fg_probs, safe_mask, neg_mode,
                         g_theta_func=None, s0=0.0,
                         linear_a=0.0, linear_b=0.1,
+                        constant_alpha=0.5,
                         tau_low=0.3, tau_high=0.5, alpha_min=0.05,
                         min_cc_size=10, eps=1e-7):
-    """Per-component channel-modulated negative supervision (v5 protocol).
+    """Per-component channel-modulated negative supervision.
 
     Args:
         fg_probs: (D, H, W) tensor of foreground probabilities.
         safe_mask: (D, H, W) tensor, 1 = safe zone.
-        neg_mode: 'uniform' (C2), 'linear' (C3), or 'channel' (C4).
-        g_theta_func: callable for isotonic propensity (C4).
+        neg_mode: 'uniform' (C2), 'constant' (C2.5), 'linear' (C3),
+                  'channel' (C4), or 'inverted' (C4-inv).
+        g_theta_func: callable for isotonic propensity (C4 / C4-inv).
         s0: minimum support for g_theta.
         linear_a, linear_b: coefficients for linear baseline (C3).
+        constant_alpha: α ≡ constant_alpha (C2.5).
         tau_low, tau_high: CC extraction thresholds.
         alpha_min: minimum alpha for nascent CCs.
         min_cc_size: minimum CC voxel count.
@@ -82,7 +85,16 @@ def compute_neg_loss_v5(fg_probs, safe_mask, neg_mode,
         return loss, {'coverage_ratio': 0.0, 'nascent_ratio': 0.0,
                       'mean_alpha': 1.0, 'n_ccs': 0}
 
-    # C3/C4: CC-level modulation
+    # C2.5: constant α everywhere (no CC extraction needed — α has no
+    # spatial structure by definition, so we keep diagnostics cheap)
+    if neg_mode == 'constant':
+        a_val = max(min(float(constant_alpha), 1.0), alpha_min)
+        loss = a_val * neg_ce.mean()
+        return loss, {'coverage_ratio': 1.0 if a_val < 1.0 else 0.0,
+                      'nascent_ratio': 0.0, 'mean_alpha': a_val,
+                      'n_ccs': 0}
+
+    # C3 / C4 / C4-inv: CC-level modulation
     with torch.no_grad():
         fg_np = fg_probs.detach().cpu().numpy()
         safe_np = safe_mask.cpu().numpy()
@@ -112,7 +124,10 @@ def compute_neg_loss_v5(fg_probs, safe_mask, neg_mode,
             # Mature interior CC: query alpha function
             if neg_mode == 'linear':
                 a_val = linear_a + linear_b * cc['log_mass']
-            else:  # channel
+            elif neg_mode == 'inverted':
+                g_val = float(g_theta_func(np.array([cc['log_mass']]))[0])
+                a_val = 1.0 - g_val + alpha_min
+            else:  # 'channel' (C4)
                 g_val = g_theta_func(np.array([cc['log_mass']]))[0]
                 a_val = float(g_val)
             a_val = max(min(a_val, 1.0), alpha_min)
@@ -153,6 +168,7 @@ def _compute_sample_loss_v6(fg_probs, boxes, safe_mask,
                              neg_mode='channel',
                              g_theta_func=None, s0=0.0,
                              linear_a=0.0, linear_b=0.1,
+                             constant_alpha=0.5,
                              ipw_mode='channel', w_max=10.0,
                              kappa=1.0, rho_min=0.15, rho_max=0.85,
                              alpha_upper=1.0,
@@ -214,6 +230,7 @@ def _compute_sample_loss_v6(fg_probs, boxes, safe_mask,
             fg_probs, safe_mask, neg_mode,
             g_theta_func=g_theta_func, s0=s0,
             linear_a=linear_a, linear_b=linear_b,
+            constant_alpha=constant_alpha,
             tau_low=tau_low, tau_high=tau_high,
             alpha_min=alpha_min, min_cc_size=min_cc_size)
 
@@ -237,6 +254,7 @@ def _compute_sample_loss_v6(fg_probs, boxes, safe_mask,
 def compute_batch_box_loss_v6(output, box_metadata_list, neg_mode='channel',
                                g_theta_func=None, s0=0.0,
                                linear_a=0.0, linear_b=0.1,
+                               constant_alpha=0.5,
                                d_margin=5, w_max=10.0, ipw_mode='channel',
                                min_cc_size=10, fg_label=None,
                                kappa=1.0, rho_min=0.15, rho_max=0.85,
@@ -291,6 +309,7 @@ def compute_batch_box_loss_v6(output, box_metadata_list, neg_mode='channel',
             neg_mode=neg_mode,
             g_theta_func=g_theta_func, s0=s0,
             linear_a=linear_a, linear_b=linear_b,
+            constant_alpha=constant_alpha,
             ipw_mode=ipw_mode, w_max=w_max,
             kappa=kappa, rho_min=rho_min, rho_max=rho_max,
             alpha_upper=alpha_upper,

@@ -1,20 +1,26 @@
-"""LatentMask Trainer v5: subclass of nnUNetTrainer for box-supervised segmentation.
+"""LatentMask Trainer v6.1: subclass of nnUNetTrainer for box-supervised segmentation.
 
-v5 changes from v3:
-  - neg_mode replaces ipw_mode: none/uniform/linear/channel → C1-C4
-  - g_theta fitted via Hungarian matching protocol (not simulated channel)
-  - CC-level negative supervision (not avg_pool3d)
-  - Diagnostics: coverage_ratio, nascent_ratio, mean_alpha
-  - Low-coverage fallback: d_safe 5→3 at epoch 100
+v6.1 contract (set by post-Codex review, 2026-04-25):
+  - Protocol is UNKNOWN to the trainer. No in-training g_θ re-fit.
+  - Calibration (g_θ, linear_a, linear_b, ρ_min, ρ_max, s0, μ) is pre-fitted
+    by `run_calibration_cv.py` and pickled to
+    `{LM_BOX_ANNOTATIONS_DIR}/_calibration_fold{fold}.pkl`.
+  - Trainer loads that artifact at `on_train_start`. If missing, we fail
+    loudly — silent fallbacks to simulated channels caused the v5
+    leakage-story problem.
 
-Configuration via neg_mode:
-  - 'none':    C1 pixel-only baseline (no box loss)
-  - 'uniform': C2 scaffold + uniform neg (α ≡ 1.0)
-  - 'linear':  C3 scaffold + linear neg (α = a + b·log m)
-  - 'channel': C4 scaffold + g_θ neg (isotonic, our method)
+Configuration via `neg_mode` (LM_NEG_MODE):
+  - 'none':     C1 pixel-only baseline (no box loss)
+  - 'uniform':  C2 scaffold + uniform neg (α ≡ 1.0)
+  - 'constant': C2.5 scaffold + constant α (LM_CONSTANT_ALPHA, default 0.5)
+  - 'linear':   C3 scaffold + linear neg (α = a + b·log m)
+  - 'channel':  C4 scaffold + g_θ neg (isotonic, our method)
+  - 'inverted': C4-inv directionality control (α = 1 − g_θ + α_min)
 """
+import hashlib
 import json
 import os
+import pickle
 import sys
 from copy import deepcopy
 from time import time
@@ -29,19 +35,19 @@ from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 
 from latentmask.losses.bag_pu_loss import compute_batch_box_loss_v6
-from latentmask.calibration.isotonic_fit import (
-    fit_g_theta_hungarian, predict_propensity, compute_ece,
-)
-from latentmask.calibration.channel_simulator import make_channel_func
+from latentmask.calibration.isotonic_fit import predict_propensity
 from latentmask.utils.cc_extraction import extract_connected_components
 from scipy import ndimage
+
+
+VALID_NEG_MODES = {'none', 'uniform', 'constant', 'linear',
+                   'channel', 'inverted'}
 
 
 class LatentMaskTrainer(nnUNetTrainer):
 
     # ── Configuration defaults ──────────────────────────────────────────
-    NEG_MODE = 'channel'       # 'none' | 'uniform' | 'linear' | 'channel'
-    STEEPNESS = 'medium'       # for simulated drop_fn: 'shallow'|'medium'|'steep'
+    NEG_MODE = 'channel'       # one of VALID_NEG_MODES
     PIXEL_FRACTION = 0.3       # fraction of training data with pixel labels
     WARMUP_EPOCHS = 50         # epochs of pixel-only training
     RAMP_EPOCHS = 50           # epochs of lambda_box ramp
@@ -50,17 +56,18 @@ class LatentMaskTrainer(nnUNetTrainer):
     W_MAX = 10.0               # IPW weight clipping
     D_MARGIN = 5               # safe zone margin (d_safe)
     MIN_CC_SIZE = 10           # minimum CC size
-    FG_LABEL = 2               # foreground label (2=tumor for LiTS)
+    FG_LABEL = 2               # foreground label (2=tumor for LiTS; override via LM_FG_LABEL)
     DIAG_EPOCHS = [50, 100, 150, 200, 250, 300]
 
-    # v5 loss hyperparameters
+    # v5/v6 loss hyperparameters
     KAPPA = 1.0                # tightness threshold
     BETA_FILL = 1.0            # L_fill weight
-    GAMMA_NEG = 1.0            # L_channel_neg weight (v5: increased from 0.1)
+    GAMMA_NEG = 1.0            # L_channel_neg weight
     ALPHA_UPPER = 1.0          # upper fill violation weight
     TAU_LOW = 0.3              # CC extraction low threshold
     TAU_HIGH = 0.5             # CC extraction high threshold
     ALPHA_MIN = 0.05           # minimum alpha for nascent CCs
+    CONSTANT_ALPHA = 0.5       # α for C2.5 ('constant')
 
     # Low-coverage fallback
     COVERAGE_FALLBACK_EPOCH = 100
@@ -75,7 +82,11 @@ class LatentMaskTrainer(nnUNetTrainer):
 
         # Read config from environment
         self.neg_mode = os.environ.get('LM_NEG_MODE', self.NEG_MODE)
-        self.steepness = os.environ.get('LM_STEEPNESS', self.STEEPNESS)
+        if self.neg_mode not in VALID_NEG_MODES:
+            raise ValueError(
+                f"Invalid LM_NEG_MODE={self.neg_mode!r}. "
+                f"Must be one of {sorted(VALID_NEG_MODES)}.")
+
         self.pixel_fraction = float(os.environ.get('LM_PIXEL_FRACTION',
                                                     self.PIXEL_FRACTION))
         self.warmup_epochs = int(os.environ.get('LM_WARMUP_EPOCHS',
@@ -96,24 +107,28 @@ class LatentMaskTrainer(nnUNetTrainer):
         self.tau_low = float(os.environ.get('LM_TAU_LOW', self.TAU_LOW))
         self.tau_high = float(os.environ.get('LM_TAU_HIGH', self.TAU_HIGH))
         self.alpha_min = float(os.environ.get('LM_ALPHA_MIN', self.ALPHA_MIN))
+        self.constant_alpha = float(os.environ.get('LM_CONSTANT_ALPHA',
+                                                    self.CONSTANT_ALPHA))
+        self.fg_label = int(os.environ.get('LM_FG_LABEL', self.FG_LABEL))
 
-        # Calibration state (set during on_train_start)
+        # Calibration state (populated by _load_calibration_artifact)
         self.g_theta = None
-        self.g_theta_s0 = None
+        self.s0 = 0.0
         self.linear_a = 0.0
         self.linear_b = 0.1
-        self.pi_hat = None
-        self.lambda_box = 0.0
+        self.mu = 0.0
         self.rho_min = 0.15
         self.rho_max = 0.85
+        self.pi_hat = None
+        self.lambda_box = 0.0
         self.pixel_keys = []
         self.box_keys = []
         self.dataloader_box = None
         self.diag_log = []
         self._epoch_box_diags = []
         self._fallback_triggered = False
+        self._calibration_meta = {}
 
-        # v6: box annotations dir for BoxSegDatasetWrapper
         self.box_annotations_dir = os.environ.get('LM_BOX_ANNOTATIONS_DIR', '')
 
         if self.neg_mode == 'none':
@@ -182,8 +197,9 @@ class LatentMaskTrainer(nnUNetTrainer):
                 self.warmup_epochs = self.num_epochs
 
         self.print_to_log_file(
-            f"LatentMask v5 split: {len(self.pixel_keys)} pixel, "
-            f"{len(self.box_keys)} box, neg_mode={self.neg_mode}"
+            f"LatentMask v6.1 split: {len(self.pixel_keys)} pixel, "
+            f"{len(self.box_keys)} box, neg_mode={self.neg_mode}, "
+            f"fg_label={self.fg_label}"
         )
 
         # Pixel DataLoader
@@ -216,10 +232,9 @@ class LatentMaskTrainer(nnUNetTrainer):
                 self.print_to_log_file(
                     f"  Box dataloader: using box_seg from {box_seg_dir}")
             else:
-                box_dataset = box_dataset_raw
-                self.print_to_log_file(
-                    "  WARNING: LM_BOX_ANNOTATIONS_DIR not set, "
-                    "box dataloader uses GT seg (leakage!)")
+                raise RuntimeError(
+                    "LM_BOX_ANNOTATIONS_DIR must be set for box-supervised "
+                    "training — loading GT seg would leak labels.")
 
             dl_box_raw = nnUNetDataLoader(
                 box_dataset, self.batch_size, initial_patch_size,
@@ -268,120 +283,118 @@ class LatentMaskTrainer(nnUNetTrainer):
         _ = next(mt_val)
         return mt_pixel, mt_val
 
-    # ── Pre-training calibration (v5: Hungarian matching) ───────────────
+    # ── Pre-training calibration (v6.1: LOAD pre-fitted artifact) ──────
 
     def on_train_start(self):
         super().on_train_start()
-        self._prefit_calibration_v5()
+        self._load_calibration_artifact()
 
-    def _prefit_calibration_v5(self):
-        """Pre-fit g_theta via Hungarian matching on pixel-labeled scans."""
-        self.print_to_log_file("Pre-fitting calibration (v5 Hungarian)...")
+    def _load_calibration_artifact(self):
+        """Load the pickled calibration produced by run_calibration_cv.py.
 
-        if self.neg_mode == 'none':
-            self.print_to_log_file("  neg_mode=none, skipping calibration.")
-            return
+        Why load instead of re-fit: the v6.1 contract states the method
+        treats the protocol as unknown. Re-fitting inside the trainer
+        (v5 behavior, using make_channel_func) would (a) require the
+        protocol's functional form and (b) produce a different g_θ than
+        what gets paper-reported in M1. We load the exact object instead.
+        """
+        self.print_to_log_file("Loading calibration artifact (v6.1)...")
 
-        # Load pixel-labeled segmentations
-        seg_list = []
-        all_fg_counts = []
-        all_total_counts = []
+        # 'uniform' needs no g_θ; 'constant' needs α only; 'none' is pixel-only.
+        # The others require a loaded artifact.
+        needs_artifact = self.neg_mode in {'linear', 'channel', 'inverted'}
+        artifact_path = os.path.join(
+            self.box_annotations_dir or '',
+            f'_calibration_fold{self.fold}.pkl')
 
-        ds = self.dataset_class(self.preprocessed_dataset_folder, self.pixel_keys)
-        for key in self.pixel_keys:
-            data, seg, _, props = ds.load_case(key)
-            seg_np = seg[0]
-            seg_list.append(seg_np)
-            if self.FG_LABEL is not None:
-                all_fg_counts.append(int((seg_np == self.FG_LABEL).sum()))
+        if not os.path.isfile(artifact_path):
+            if needs_artifact:
+                raise FileNotFoundError(
+                    f"Calibration artifact not found: {artifact_path}. "
+                    f"Run `python -m latentmask.scripts.run_calibration_cv "
+                    f"--dataset_dir ... --box_annotations_dir "
+                    f"{self.box_annotations_dir} --protocol ... "
+                    f"--fold {self.fold} --fg_label {self.fg_label}` first.")
             else:
-                all_fg_counts.append(int((seg_np > 0).sum()))
-            all_total_counts.append(int(seg_np.size))
+                self.print_to_log_file(
+                    f"  neg_mode={self.neg_mode} does not require g_θ; "
+                    f"skipping artifact load.")
+                return
 
-        # Estimate pi_hat
-        total_fg = sum(all_fg_counts)
-        total_vox = sum(all_total_counts)
-        self.pi_hat = total_fg / max(total_vox, 1)
-        self.print_to_log_file(f"  pi_hat = {self.pi_hat:.6f}")
+        with open(artifact_path, 'rb') as f:
+            art = pickle.load(f)
 
-        # Create drop function (size-dependent annotation simulation)
-        all_ccs_tmp = []
-        for seg_np in seg_list:
-            ccs = extract_connected_components(
-                seg_np, min_size=self.MIN_CC_SIZE, fg_label=self.FG_LABEL)
-            all_ccs_tmp.extend(ccs)
+        # Identity invariants. Mismatch on any = refuse to train
+        # (Codex finding 2026-05-06: fold + fg_label was too thin).
+        if art.get('fold') != self.fold:
+            raise RuntimeError(
+                f"Calibration fold ({art.get('fold')}) != "
+                f"training fold ({self.fold})")
+        if art.get('fg_label') != self.fg_label:
+            raise RuntimeError(
+                f"Calibration fg_label ({art.get('fg_label')}) != "
+                f"training fg_label ({self.fg_label})")
 
-        if len(all_ccs_tmp) == 0:
-            self.print_to_log_file("  WARNING: no CCs found, skipping fit.")
-            return
+        # Pin the actual calibration scans. pixel_keys is the trainer-side
+        # split (same RNG seed + pixel_fraction as the calibration script);
+        # if the two disagree, the g_θ was fit on a different subset than
+        # the trainer thinks, and the M1 ECE no longer applies.
+        art_hash = art.get('pixel_keys_hash')
+        if art_hash is not None:
+            train_hash = hashlib.sha256(
+                '\n'.join(sorted(self.pixel_keys)).encode()).hexdigest()[:16]
+            if art_hash != train_hash:
+                raise RuntimeError(
+                    f"Calibration pixel_keys_hash ({art_hash}) != "
+                    f"training pixel_keys_hash ({train_hash}). "
+                    f"Re-run run_calibration_cv.py with matching "
+                    f"--pixel_fraction / --fold.")
 
-        all_log_sizes = np.array([cc['log_size'] for cc in all_ccs_tmp])
-        mu = float(np.median(all_log_sizes))
-        self.print_to_log_file(
-            f"  mu={mu:.2f}, n_CCs={len(all_log_sizes)}")
-
-        # Simulated drop function based on steepness
-        g_true = make_channel_func(self.steepness, mu)
-
-        def drop_fn(log_sizes):
-            return g_true(log_sizes)
-
-        # Fit via Hungarian matching
-        rng = np.random.default_rng(seed=42 + self.fold)
-        ir, s0, linear_a, linear_b, stats = fit_g_theta_hungarian(
-            seg_list, fg_label=self.FG_LABEL,
-            min_cc_size=self.MIN_CC_SIZE, iou_threshold=0.3,
-            drop_fn=drop_fn, rng=rng)
-
-        self.g_theta = ir
-        self.g_theta_s0 = s0
-        self.linear_a = linear_a
-        self.linear_b = linear_b
-
-        self.print_to_log_file(
-            f"  g_theta fitted: s0={s0:.2f}, "
-            f"unmatched_rate={stats['unmatched_rate']:.3f}, "
-            f"ambiguous_rate={stats['ambiguous_rate']:.3f}")
-        self.print_to_log_file(
-            f"  linear: a={linear_a:.4f}, b={linear_b:.4f}")
-
-        # Estimate filling rate bounds
-        fill_ratios = []
-        for seg_np in seg_list:
-            ccs = extract_connected_components(
-                seg_np, min_size=self.MIN_CC_SIZE, fg_label=self.FG_LABEL)
-            for cc in ccs:
-                bbox = cc['bbox']
-                bbox_vol = 1
-                for (s, e) in bbox:
-                    bbox_vol *= max(e - s, 1)
-                if bbox_vol > 0:
-                    fill_ratios.append(cc['size'] / bbox_vol)
-
-        if fill_ratios:
-            fill_ratios = np.array(fill_ratios)
-            self.rho_min = float(np.percentile(fill_ratios, 10))
-            self.rho_max = float(np.percentile(fill_ratios, 95))
-            self.print_to_log_file(
-                f"  rho bounds: [{self.rho_min:.3f}, {self.rho_max:.3f}]")
-
-        # Save calibration results
-        calib_path = os.path.join(self.output_folder, 'calibration_prefit.json')
-        calib_results = {
-            'version': 'v6',
-            'neg_mode': self.neg_mode,
-            'pi_hat': self.pi_hat,
-            'mu': mu,
-            's0': s0,
-            'linear_a': linear_a,
-            'linear_b': linear_b,
-            'rho_min': self.rho_min,
-            'rho_max': self.rho_max,
-            'steepness': self.steepness,
-            **stats,
+        self.g_theta = art['g_theta']  # dict with x/y thresholds (version-stable)
+        self.s0 = float(art['s0'])
+        self.linear_a = float(art['linear_a'])
+        self.linear_b = float(art['linear_b'])
+        self.mu = float(art['mu'])
+        self.rho_min = float(art['rho_min'])
+        self.rho_max = float(art['rho_max'])
+        self._calibration_meta = {
+            'protocol': art.get('protocol'),
+            'cv_max_ece': art.get('cv_max_ece'),
+            'ece_isotonic_full': art.get('ece_isotonic_full'),
+            'gate_pass': art.get('gate_pass'),
+            'gate_threshold': art.get('gate_threshold'),
+            'n_total_ccs': art.get('n_total_ccs'),
+            'artifact_timestamp': art.get('timestamp'),
+            'artifact_format_version': art.get('artifact_format_version'),
+            'pixel_keys_hash': art.get('pixel_keys_hash'),
+            'match_params_hash': art.get('match_params_hash'),
         }
-        with open(calib_path, 'w') as f:
-            json.dump(calib_results, f, indent=2)
+
+        self.print_to_log_file(
+            f"  loaded protocol={self._calibration_meta.get('protocol')}, "
+            f"fold={self.fold}, fg_label={self.fg_label}, "
+            f"CCs={self._calibration_meta.get('n_total_ccs')}, "
+            f"cv_max_ece={self._calibration_meta.get('cv_max_ece')}")
+        self.print_to_log_file(
+            f"  s0={self.s0:.3f}, mu={self.mu:.3f}, "
+            f"linear a={self.linear_a:.4f} b={self.linear_b:.4f}, "
+            f"rho=[{self.rho_min:.3f}, {self.rho_max:.3f}]")
+
+        # pi_hat is only used by legacy paths; not required in v6.1.
+        # Persist a copy of the loaded artifact in the run folder for audit.
+        audit_path = os.path.join(
+            self.output_folder, 'calibration_loaded.json')
+        audit = {k: v for k, v in self._calibration_meta.items()}
+        audit.update({
+            'fold': self.fold,
+            'fg_label': self.fg_label,
+            's0': self.s0, 'mu': self.mu,
+            'linear_a': self.linear_a, 'linear_b': self.linear_b,
+            'rho_min': self.rho_min, 'rho_max': self.rho_max,
+            'artifact_path': artifact_path,
+        })
+        with open(audit_path, 'w') as f:
+            json.dump(audit, f, indent=2)
 
     # ── Lambda schedule ─────────────────────────────────────────────────
 
@@ -479,11 +492,10 @@ class LatentMaskTrainer(nnUNetTrainer):
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        # g_theta function for propensity queries
+        # g_theta function for propensity queries (loaded from artifact)
         if self.g_theta is not None:
             def g_func(log_sizes):
-                return predict_propensity(
-                    self.g_theta, log_sizes, self.g_theta_s0)
+                return predict_propensity(self.g_theta, log_sizes, self.s0)
         else:
             def g_func(log_sizes):
                 return np.ones_like(log_sizes)
@@ -501,15 +513,16 @@ class LatentMaskTrainer(nnUNetTrainer):
                 out_full, box_metadata_list,
                 neg_mode=self.neg_mode,
                 g_theta_func=g_func,
-                s0=self.g_theta_s0 or 0.0,
+                s0=self.s0,
                 linear_a=self.linear_a,
                 linear_b=self.linear_b,
+                constant_alpha=self.constant_alpha,
                 d_margin=self.d_margin,
                 w_max=self.w_max,
                 ipw_mode=('uniform' if self.neg_mode == 'uniform'
                           else 'channel'),
                 min_cc_size=self.MIN_CC_SIZE,
-                fg_label=self.FG_LABEL,
+                fg_label=self.fg_label,
                 kappa=self.kappa,
                 rho_min=self.rho_min,
                 rho_max=self.rho_max,
@@ -575,7 +588,7 @@ class LatentMaskTrainer(nnUNetTrainer):
                 f"d_safe: {old_d} -> {self.d_margin}")
 
     def _log_diagnostics(self):
-        """Log v5 diagnostics at checkpoint epochs."""
+        """Log v6 diagnostics at checkpoint epochs."""
         diag = {
             'epoch': self.current_epoch,
             'lambda_box': self.lambda_box,
@@ -604,7 +617,7 @@ class LatentMaskTrainer(nnUNetTrainer):
             json.dump(self.diag_log, f, indent=2)
 
         self.print_to_log_file(
-            f"  [v5 diag] epoch={self.current_epoch}, "
+            f"  [v6 diag] epoch={self.current_epoch}, "
             f"coverage={diag.get('coverage_ratio_mean', 'N/A')}, "
             f"nascent={diag.get('nascent_ratio_mean', 'N/A')}, "
             f"mean_alpha={diag.get('mean_alpha_mean', 'N/A')}")
@@ -620,9 +633,9 @@ class LatentMaskTrainer(nnUNetTrainer):
         config_path = os.path.join(self.output_folder,
                                     'latentmask_config.json')
         config = {
-            'version': 'v6',
+            'version': 'v6.1',
             'neg_mode': self.neg_mode,
-            'steepness': self.steepness,
+            'fg_label': self.fg_label,
             'pixel_fraction': self.pixel_fraction,
             'warmup_epochs': self.warmup_epochs,
             'ramp_epochs': self.ramp_epochs,
@@ -630,7 +643,6 @@ class LatentMaskTrainer(nnUNetTrainer):
             'lambda_box_max': self.lambda_box_max,
             'w_max': self.w_max,
             'd_margin': self.d_margin,
-            'pi_hat': self.pi_hat,
             'n_pixel_keys': len(self.pixel_keys),
             'n_box_keys': len(self.box_keys),
             'kappa': self.kappa,
@@ -642,9 +654,13 @@ class LatentMaskTrainer(nnUNetTrainer):
             'tau_low': self.tau_low,
             'tau_high': self.tau_high,
             'alpha_min': self.alpha_min,
+            'constant_alpha': self.constant_alpha,
             'linear_a': self.linear_a,
             'linear_b': self.linear_b,
+            's0': self.s0,
+            'mu': self.mu,
             'fallback_triggered': self._fallback_triggered,
+            'calibration_meta': self._calibration_meta,
         }
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)

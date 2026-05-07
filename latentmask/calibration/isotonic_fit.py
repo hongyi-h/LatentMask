@@ -28,16 +28,37 @@ def fit_isotonic(log_sizes, selected_flags):
 def predict_propensity(ir, log_sizes, s0):
     """Predict propensity scores, clamping below support minimum.
 
-    Args:
-        ir: fitted IsotonicRegression.
-        log_sizes: array of log sizes to query.
-        s0: minimum support value.
-
-    Returns:
-        Array of predicted propensities in [0.01, 1.0].
+    Accepts either a fitted sklearn IsotonicRegression or a dict with
+    'x_thresholds' and 'y_thresholds' keys (the sklearn-version-stable
+    serialization used in v6.1 calibration artifacts).
     """
     log_sizes = np.maximum(np.asarray(log_sizes, dtype=np.float64), s0)
+    if isinstance(ir, dict):
+        xs = np.asarray(ir['x_thresholds'], dtype=np.float64)
+        ys = np.asarray(ir['y_thresholds'], dtype=np.float64)
+        # np.interp is monotone-preserving when (xs, ys) are sorted
+        # and the original fit was monotone — true for IsotonicRegression.
+        return np.interp(log_sizes, xs, ys)
     return ir.predict(log_sizes)
+
+
+def isotonic_to_dict(ir):
+    """Serialize a fitted sklearn IsotonicRegression to plain arrays.
+
+    Avoids sklearn-version pickle fragility (Codex finding, 2026-05-06):
+    we persist only the step function (x_thresholds_, y_thresholds_) plus
+    settings, so the trainer can reconstruct predictions via np.interp
+    without loading sklearn at all.
+    """
+    return {
+        'kind': 'isotonic_step_function',
+        'x_thresholds': np.asarray(ir.X_thresholds_).tolist(),
+        'y_thresholds': np.asarray(ir.y_thresholds_).tolist(),
+        'increasing': bool(getattr(ir, 'increasing_', True)),
+        'y_min': float(getattr(ir, 'y_min', 0.01) or 0.01),
+        'y_max': float(getattr(ir, 'y_max', 0.99) or 0.99),
+        'out_of_bounds': str(getattr(ir, 'out_of_bounds', 'clip')),
+    }
 
 
 def compute_ece(predicted_probs, true_labels, n_bins=10):

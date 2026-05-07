@@ -279,7 +279,7 @@ def main():
     }
 
     out_path = os.path.join(
-        args.output, f'calibration_{args.protocol}_v6.json')
+        args.output, f'calibration_{args.protocol}_fold{args.fold}_v6.json')
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"  Report → {out_path}")

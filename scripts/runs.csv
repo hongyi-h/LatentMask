@@ -1,0 +1,63 @@
+run_id,block,config,protocol,fold,seed,dataset,fg_label,variant,status,notes
+# Block 0 — prerequisites (CPU or short GPU)
+R002,B0,box_gen,all,all,42,LiTS,2,,TODO,"Run via scripts/a1_generate_box_annotations.sh (not via run.py)"
+R003,B0,channel,P-steep,0,42,LiTS,2,sanity_overfit,TODO,"Sanity: 1 scan 5 epochs. Override LM_NUM_EPOCHS=5"
+# Block 3 — calibration (CPU, produces _calibration_fold{f}.pkl)
+R004,B3,calib,P-uniform,all,42,LiTS,2,,TODO,"Gate: g_θ should be ~flat (slope small)"
+R005,B3,calib,P-mild,all,42,LiTS,2,,TODO,"Gate: cv_max_ece < 0.15"
+R006,B3,calib,P-steep,all,42,LiTS,2,,TODO,"Gate: cv_max_ece < 0.15"
+# Block 1 core — 5-fold CV on P-steep
+R007,B1,none,P-steep,0,42,LiTS,2,C0_upperbound,TODO,"C0: full pixel GT upper bound. neg_mode=none but pixel_fraction=1.0"
+R008,B1,none,P-steep,1,42,LiTS,2,C0_upperbound,TODO,
+R009,B1,none,P-steep,2,42,LiTS,2,C0_upperbound,TODO,
+R010,B1,none,P-steep,3,42,LiTS,2,C0_upperbound,TODO,
+R011,B1,none,P-steep,4,42,LiTS,2,C0_upperbound,TODO,
+R012,B1,none,P-steep,0,42,LiTS,2,C1_pixelonly,TODO,"C1: pixel-only (30% pixel). neg_mode=none. Gate: C1 < C0"
+R013,B1,none,P-steep,1,42,LiTS,2,C1_pixelonly,TODO,
+R014,B1,none,P-steep,2,42,LiTS,2,C1_pixelonly,TODO,
+R015,B1,none,P-steep,3,42,LiTS,2,C1_pixelonly,TODO,
+R016,B1,none,P-steep,4,42,LiTS,2,C1_pixelonly,TODO,
+R017,B1,uniform,P-steep,0,42,LiTS,2,C2_uniform,TODO,"C2: scaffold + uniform neg. Gate: C2 > C1"
+R018,B1,uniform,P-steep,1,42,LiTS,2,C2_uniform,TODO,
+R019,B1,uniform,P-steep,2,42,LiTS,2,C2_uniform,TODO,
+R020,B1,uniform,P-steep,3,42,LiTS,2,C2_uniform,TODO,
+R021,B1,uniform,P-steep,4,42,LiTS,2,C2_uniform,TODO,
+R022,B1,linear,P-steep,0,42,LiTS,2,C3_linear,TODO,"C3: scaffold + linear neg"
+R023,B1,linear,P-steep,1,42,LiTS,2,C3_linear,TODO,
+R024,B1,linear,P-steep,2,42,LiTS,2,C3_linear,TODO,
+R025,B1,linear,P-steep,3,42,LiTS,2,C3_linear,TODO,
+R026,B1,linear,P-steep,4,42,LiTS,2,C3_linear,TODO,
+R027,B1,channel,P-steep,0,42,LiTS,2,C4_method,TODO,"C4: full method. Gate: C4 > C2 +3pt (soft)"
+R028,B1,channel,P-steep,1,42,LiTS,2,C4_method,TODO,
+R029,B1,channel,P-steep,2,42,LiTS,2,C4_method,TODO,
+R030,B1,channel,P-steep,3,42,LiTS,2,C4_method,TODO,
+R031,B1,channel,P-steep,4,42,LiTS,2,C4_method,TODO,
+# Block 1c — controls (2 folds each; directly gate paper-dies decisions)
+R032,B1c,constant,P-steep,0,42,LiTS,2,C2_5_constant,TODO,"C2.5: alpha≡0.5. Gate: C4 > C2.5"
+R032b,B1c,constant,P-steep,1,42,LiTS,2,C2_5_constant,TODO,
+R033,B1c,inverted,P-steep,0,42,LiTS,2,C4inv_directionality,TODO,"C4-inv: alpha = 1 - g_θ + alpha_min. Gate: C4 > C4-inv"
+R033b,B1c,inverted,P-steep,1,42,LiTS,2,C4inv_directionality,TODO,
+# Block 1b — multi-protocol robustness
+R034,B1b,uniform,P-uniform,0,42,LiTS,2,C2_protoRobust,TODO,"P-uniform: g_θ should be ~flat"
+R035,B1b,uniform,P-uniform,1,42,LiTS,2,C2_protoRobust,TODO,
+R036,B1b,channel,P-uniform,0,42,LiTS,2,C4_protoRobust,TODO,"C4 under P-uniform should be ~ neutral vs C2"
+R037,B1b,channel,P-uniform,1,42,LiTS,2,C4_protoRobust,TODO,
+R038,B1b,uniform,P-mild,0,42,LiTS,2,C2_protoRobust,TODO,
+R039,B1b,uniform,P-mild,1,42,LiTS,2,C2_protoRobust,TODO,
+R040,B1b,channel,P-mild,0,42,LiTS,2,C4_protoRobust,TODO,
+R041,B1b,channel,P-mild,1,42,LiTS,2,C4_protoRobust,TODO,
+# Block 1d — protocol-mismatch transfer
+R042,B1d,channel,P-mild,0,42,LiTS,2,C4_xfer_steep_to_mild,TODO,"Train on P-mild boxes, but use P-steep-fitted g_θ. Handled in run.py via --g_theta_from_protocol"
+# Block 4 — sensitivity (fold 0, P-steep, C4 unless noted)
+R043,B4,channel,P-steep,0,42,LiTS,2,d_safe=3,TODO,"LM_D_MARGIN=3"
+R044,B4,channel,P-steep,0,42,LiTS,2,tau_low=0.2,TODO,"LM_TAU_LOW=0.2"
+R045,B4,channel,P-steep,0,42,LiTS,2,tau_low=0.4,TODO,"LM_TAU_LOW=0.4"
+R046,B4,channel,P-steep,0,42,LiTS,2,alpha_min=0.02,TODO,"LM_ALPHA_MIN=0.02"
+R047,B4,channel,P-steep,0,42,LiTS,2,alpha_min=0.10,TODO,"LM_ALPHA_MIN=0.10"
+R048,B4,uniform,P-steep,0,42,LiTS,2,C2_d_safe=3,TODO,"C2 + d_safe=3. LM_D_MARGIN=3"
+# Block 5 — qualitative (post-training, no GPU training needed)
+R049,B5,qualitative,P-steep,0,42,LiTS,2,,TODO,"Pick 3–5 val scans by small-lesion count; render comparisons. Manual."
+# Block 6 — BraTS-METS confirmatory (blocked on data prep)
+R050,B6,uniform,P-steep,0,42,BraTSMETS,1,,TODO,"BLOCKED on M0b (data prep)"
+R051,B6,channel,P-steep,0,42,BraTSMETS,1,,TODO,"BLOCKED on M0b"
+R052,B6,constant,P-steep,0,42,BraTSMETS,1,,TODO,"BLOCKED on M0b"
